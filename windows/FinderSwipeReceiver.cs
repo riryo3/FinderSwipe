@@ -121,10 +121,12 @@ internal static class Program
             byte[] data = udp.Receive(ref from);
             string s = Encoding.UTF8.GetString(data);
             if (!s.StartsWith(Magic)) continue;
+            // 形式: FSWIPE1 <送信元ID> <連番> <アクション> (カーソル共有の合図は要素が多く、ここでは読み飛ばす)
             string[] parts = s.Substring(Magic.Length).Split(' ');
-            if (parts.Length != 2) continue;
+            if (parts.Length != 3) continue;
             long seq;
-            if (!long.TryParse(parts[0], out seq)) continue;
+            if (!long.TryParse(parts[1], out seq)) continue;
+            string action = parts[2];
 
             // 同じ合図は3回送られてくるので、2秒以内の重複は捨てる
             DateTime now = DateTime.UtcNow;
@@ -135,16 +137,16 @@ internal static class Program
             Foreground kind = ForegroundKind();
             if (kind == Foreground.None)
             {
-                Console.WriteLine("受信: " + parts[1] + " (対応アプリが最前面ではないので実行しません)");
+                Console.WriteLine("受信: " + action + " (対応アプリが最前面ではないので実行しません)");
                 continue;
             }
-            if (kind == Foreground.Chromium && parts[1] != "back" && parts[1] != "forward")
+            if (kind == Foreground.Chromium && action != "back" && action != "forward")
             {
-                Console.WriteLine("受信: " + parts[1] + " (Chromium 系では履歴移動だけ対応)");
+                Console.WriteLine("受信: " + action + " (Chromium 系では履歴移動だけ対応)");
                 continue;
             }
-            Console.WriteLine("受信: " + parts[1]);
-            Act(parts[1]);
+            Console.WriteLine("受信: " + action);
+            Act(action);
         }
     }
 }

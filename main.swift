@@ -210,31 +210,52 @@ enum LinkNet {
     static let port: UInt16 = 45987
     private static let magic = "FSWIPE1 "
     private static var seenSeqs: [UInt64: Double] = [:]
+    private static var fastSeq: UInt64 = 0
 
+    /// 自分の識別子(自分の送った合図を自分で受けないため)
+    static let machineID: String = {
+        if let s = UserDefaults.standard.string(forKey: "machineID") { return s }
+        let s = String(UInt32.random(in: 0..<UInt32.max), radix: 16)
+        UserDefaults.standard.set(s, forKey: "machineID")
+        return s
+    }()
+
+    private static func udpSend(_ text: String) {
+        let payload = Array(text.utf8)
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = INADDR_BROADCAST
+        payload.withUnsafeBytes { buf in
+            withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    _ = sendto(fd, buf.baseAddress, buf.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        close(fd)
+    }
+
+    /// スワイプの合図(確実に届けたいので同じものを3回送る)
     static func send(_ wire: String) {
         let seq = UInt64(Date().timeIntervalSince1970 * 1000)
-        let payload = Array((magic + "\(seq) " + wire).utf8)
+        let text = magic + "\(machineID) \(seq) \(wire)"
         DispatchQueue.global().async {
-            for _ in 0..<3 {  // UDP の取りこぼし対策に、同じ合図を3回送る
-                let fd = socket(AF_INET, SOCK_DGRAM, 0)
-                guard fd >= 0 else { return }
-                var yes: Int32 = 1
-                setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
-                var addr = sockaddr_in()
-                addr.sin_family = sa_family_t(AF_INET)
-                addr.sin_port = port.bigEndian
-                addr.sin_addr.s_addr = INADDR_BROADCAST
-                payload.withUnsafeBytes { buf in
-                    withUnsafePointer(to: &addr) { p in
-                        p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                            _ = sendto(fd, buf.baseAddress, buf.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                        }
-                    }
-                }
-                close(fd)
+            for _ in 0..<3 {
+                udpSend(text)
                 Thread.sleep(forTimeInterval: 0.03)
             }
         }
+    }
+
+    /// カーソル共有の細かい合図(速さ優先で1回だけ送る)
+    static func sendFast(_ body: String) {
+        fastSeq &+= 1
+        udpSend(magic + "\(machineID) \(fastSeq) \(body)")
     }
 
     static func startReceiver() {
@@ -260,15 +281,218 @@ enum LinkNet {
                 let s = String(decoding: buf[0..<n], as: UTF8.self)
                 guard s.hasPrefix(magic) else { continue }
                 let parts = s.dropFirst(magic.count).split(separator: " ")
-                guard parts.count == 2, let seq = UInt64(parts[0]) else { continue }
-                // 3回送られてくる同じ合図は1回だけ実行する
-                let now = Date().timeIntervalSince1970
-                if let seen = seenSeqs[seq], now - seen < 2 { continue }
-                seenSeqs[seq] = now
-                seenSeqs = seenSeqs.filter { now - $0.value < 10 }
-                Engine.shared.receiveLink(String(parts[1]))
+                guard parts.count >= 3, String(parts[0]) != machineID, let seq = UInt64(parts[1]) else { continue }
+                let kind = String(parts[2])
+                if SwipeAction.fromWire(kind) != nil {
+                    // スワイプの合図: 3回送られてくる同じものは1回だけ実行する
+                    let now = Date().timeIntervalSince1970
+                    if let seen = seenSeqs[seq], now - seen < 2 { continue }
+                    seenSeqs[seq] = now
+                    seenSeqs = seenSeqs.filter { now - $0.value < 10 }
+                    Engine.shared.receiveLink(kind)
+                } else {
+                    // カーソル共有の合図
+                    CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) })
+                }
             }
         }
+    }
+}
+
+// MARK: - カーソル共有(試作)
+
+func cursorTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    CursorShare.shared.handle(type: type, event: event)
+}
+
+/// カーソル共有の試作。右端にカーソルが触れたら操作を相方に渡す。
+/// 送り側はイベントタップでマウスとキーを横取りして合図に変換し、
+/// 受け側は合図から合成イベントを作って自分の画面で再現する。
+/// 受け側でカーソルが左端を越えたら手元に返る。送信中に Esc を押しても返る(非常口)。
+final class CursorShare {
+    static let shared = CursorShare()
+    var enabled = UserDefaults.standard.bool(forKey: "cursorShare")
+    var onStatus: ((String) -> Void)?
+    private var tap: CFMachPort?
+    private var tapSource: CFRunLoopSource?
+    private(set) var sending = false
+    private(set) var receiving = false
+    private var vx: Double = 0, vy: Double = 0
+
+    private var mainBounds: CGRect { CGDisplayBounds(CGMainDisplayID()) }
+
+    func setEnabled(_ on: Bool) {
+        enabled = on
+        UserDefaults.standard.set(on, forKey: "cursorShare")
+        if on {
+            installTap()
+        } else {
+            endSending(notify: true)
+            receiving = false
+            removeTap()
+        }
+    }
+
+    func installTap() {
+        guard tap == nil else { return }
+        var mask: CGEventMask = 0
+        let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+                                    .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+                                    .otherMouseDown, .otherMouseUp, .scrollWheel, .keyDown, .keyUp, .flagsChanged]
+        for t in types { mask |= (CGEventMask(1) << CGEventMask(t.rawValue)) }
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                          eventsOfInterest: mask, callback: cursorTapCallback, userInfo: nil) else {
+            status("カーソル共有： タップを作れませんでした（許可を確認してください）")
+            return
+        }
+        self.tap = tap
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        tapSource = src
+        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    func removeTap() {
+        if let tap = tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+        }
+        if let src = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
+        tap = nil
+        tapSource = nil
+    }
+
+    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return Unmanaged.passUnretained(event)
+        }
+        guard enabled, !receiving else { return Unmanaged.passUnretained(event) }
+        if !sending {
+            // 右端に触れたら開始する
+            if type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged {
+                let b = mainBounds
+                let loc = event.location
+                if loc.x >= b.maxX - 1 {
+                    beginSending(yRatio: Double((loc.y - b.minY) / b.height))
+                    return nil
+                }
+            }
+            return Unmanaged.passUnretained(event)
+        }
+        // 送信中: Esc は非常口(合図にせず、その場で手元に戻す)
+        if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53 {
+            endSending(notify: true)
+            return nil
+        }
+        switch type {
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            let dx = event.getIntegerValueField(.mouseEventDeltaX)
+            let dy = event.getIntegerValueField(.mouseEventDeltaY)
+            if dx != 0 || dy != 0 { LinkNet.sendFast("mv \(dx) \(dy)") }
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            LinkNet.sendFast("dn \(event.getIntegerValueField(.mouseEventButtonNumber))")
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            LinkNet.sendFast("up \(event.getIntegerValueField(.mouseEventButtonNumber))")
+        case .scrollWheel:
+            let dy = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
+            let dx = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
+            if dx != 0 || dy != 0 { LinkNet.sendFast("sc \(Int(dy)) \(Int(dx))") }
+        case .keyDown:
+            LinkNet.sendFast("kd \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
+        case .keyUp:
+            LinkNet.sendFast("ku \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
+        case .flagsChanged:
+            LinkNet.sendFast("fl \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
+        default:
+            return Unmanaged.passUnretained(event)
+        }
+        return nil
+    }
+
+    private func beginSending(yRatio: Double) {
+        sending = true
+        for _ in 0..<3 { LinkNet.sendFast("enter \(yRatio)") }  // 大事な合図なので3回送る
+        status("カーソル共有： 相手に渡しました")
+    }
+
+    func endSending(notify: Bool) {
+        guard sending else { return }
+        sending = false
+        if notify { LinkNet.sendFast("leave") }
+        status("カーソル共有： 手元に戻りました")
+    }
+
+    /// 受け側: LinkNet から呼ばれる
+    func receive(_ kind: String, args: [String]) {
+        guard enabled else { return }
+        let b = mainBounds
+        switch kind {
+        case "enter":
+            guard !sending else { return }
+            receiving = true
+            vx = Double(b.minX)
+            let ratio = args.first.flatMap { Double($0) } ?? 0.5
+            vy = Double(b.minY) + ratio * Double(b.height)
+            warp()
+            status("カーソル共有： 相手から受け取りました")
+        case "leave":
+            if receiving { receiving = false; status("カーソル共有： 相手に戻りました") }
+            if sending { endSending(notify: false) }
+        case "mv":
+            guard receiving, args.count == 2, let dx = Double(args[0]), let dy = Double(args[1]) else { return }
+            vx += dx
+            vy += dy
+            vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
+            if vx < Double(b.minX) {
+                receiving = false
+                LinkNet.sendFast("leave")
+                status("カーソル共有： 手元に返しました")
+                return
+            }
+            vx = min(vx, Double(b.maxX) - 1)
+            warp()
+        case "dn", "up":
+            guard receiving, let n = args.first.flatMap({ Int($0) }) else { return }
+            postMouse(down: kind == "dn", button: n)
+        case "sc":
+            guard receiving, args.count == 2, let dy = Int32(args[0]), let dx = Int32(args[1]) else { return }
+            if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) {
+                e.location = CGPoint(x: vx, y: vy)
+                e.post(tap: .cghidEventTap)
+            }
+        case "kd", "ku", "fl":
+            guard receiving, args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
+            if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: kind != "ku") {
+                e.flags = CGEventFlags(rawValue: flagsRaw)
+                if kind == "fl" { e.type = .flagsChanged }
+                e.post(tap: .cghidEventTap)
+            }
+        default:
+            break
+        }
+    }
+
+    private func warp() {
+        CGWarpMouseCursorPosition(CGPoint(x: vx, y: vy))
+        CGAssociateMouseAndMouseCursorPosition(1)
+    }
+
+    private func postMouse(down: Bool, button: Int) {
+        let downType: CGEventType, upType: CGEventType, btn: CGMouseButton
+        switch button {
+        case 1: downType = .rightMouseDown; upType = .rightMouseUp; btn = .right
+        case 2: downType = .otherMouseDown; upType = .otherMouseUp; btn = .center
+        default: downType = .leftMouseDown; upType = .leftMouseUp; btn = .left
+        }
+        if let e = CGEvent(mouseEventSource: nil, mouseType: down ? downType : upType,
+                           mouseCursorPosition: CGPoint(x: vx, y: vy), mouseButton: btn) {
+            e.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func status(_ s: String) {
+        DispatchQueue.main.async { [weak self] in self?.onStatus?(s) }
     }
 }
 
@@ -323,6 +547,7 @@ final class App: NSObject, NSApplicationDelegate {
     var enabledItem: NSMenuItem!
     var remoteItem: NSMenuItem!
     var linkItem: NSMenuItem!
+    var cursorItem: NSMenuItem!
     var tapItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
@@ -338,6 +563,8 @@ final class App: NSObject, NSApplicationDelegate {
         remoteItem.target = self
         linkItem = NSMenuItem(title: "相方モード（ネットワークで合図を送受信）", action: #selector(toggleLink), keyEquivalent: "")
         linkItem.target = self
+        cursorItem = NSMenuItem(title: "カーソル共有（右端で相手に渡す）", action: #selector(toggleCursor), keyEquivalent: "")
+        cursorItem.target = self
         tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
         tapItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
@@ -348,7 +575,7 @@ final class App: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -361,6 +588,11 @@ final class App: NSObject, NSApplicationDelegate {
         Engine.shared.onStats = { [weak self] frames, maxFingers in
             self?.statsItem.title = "受信： \(frames)フレーム / 最大\(maxFingers)本"
         }
+        CursorShare.shared.onStatus = { [weak self] label in
+            self?.flashIcon()
+            self?.lastItem.title = "最後の検出： \(label)"
+        }
+        if CursorShare.shared.enabled { CursorShare.shared.installTap() }
 
         // キーを送るにはアクセシビリティ許可が要る
         if !AXIsProcessTrusted() {
@@ -384,6 +616,7 @@ final class App: NSObject, NSApplicationDelegate {
         enabledItem.state = Engine.shared.enabled ? .on : .off
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
         linkItem.state = Engine.shared.linkMode ? .on : .off
+        cursorItem.state = CursorShare.shared.enabled ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
     }
 
@@ -414,6 +647,11 @@ final class App: NSObject, NSApplicationDelegate {
     @objc func toggleLink() {
         Engine.shared.linkMode.toggle()
         UserDefaults.standard.set(Engine.shared.linkMode, forKey: "linkMode")
+        refreshMenu()
+    }
+
+    @objc func toggleCursor() {
+        CursorShare.shared.setEnabled(!CursorShare.shared.enabled)
         refreshMenu()
     }
 
