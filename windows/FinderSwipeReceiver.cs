@@ -390,8 +390,19 @@ internal static class Program
         ActSwipe(action);
     }
 
+    private static Mutex singleMutex;
+
     private static void Main()
     {
+        // 二重起動の防止(複数動くと合図が重なって競合するため)
+        bool createdNew;
+        singleMutex = new Mutex(true, "OneManCursor.WindowsPeer", out createdNew);
+        if (!createdNew)
+        {
+            Console.WriteLine("すでに起動しています。二重には起動しません。");
+            Thread.Sleep(2000);
+            return;
+        }
         LoadConfig();
         sender = new UdpClient();
         sender.EnableBroadcast = true;
