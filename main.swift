@@ -239,7 +239,7 @@ enum LinkNet {
             var sent = 0
             while sent < bytes.count {
                 let n = bytes.withUnsafeBytes { buf in
-                    send(fd, buf.baseAddress!.advanced(by: sent), bytes.count - sent, 0)
+                    Darwin.send(fd, buf.baseAddress!.advanced(by: sent), bytes.count - sent, 0)
                 }
                 if n <= 0 { return false }
                 sent += n
