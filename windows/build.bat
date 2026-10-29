@@ -7,12 +7,12 @@ if not exist "%CSC%" (
   pause
   exit /b 1
 )
-"%CSC%" /nologo /platform:x64 /target:exe /out:FinderSwipeReceiver.exe FinderSwipeReceiver.cs
+"%CSC%" /nologo /platform:x64 /target:exe /out:OneManCursor.exe OneManCursor.cs
 if errorlevel 1 (
   echo Build failed.
   pause
   exit /b 1
 )
-echo Build OK: FinderSwipeReceiver.exe
+echo Build OK: OneManCursor.exe
 echo On first run, Windows Firewall will ask. Allow on Private network.
 pause

@@ -1,12 +1,12 @@
-// FinderSwipeReceiver (試作) - Windows 側の参加者
-// Mac 側の FinderSwipe と合図(UDP ブロードキャスト)をやり取りする。
+// ワンマンカーソル (試作) - Windows 側の参加者
+// Mac 側のワンマンカーソル / FinderSwipe と合図をやり取りする。
 // 役割は2つ:
 //  1) スワイプの合図 → エクスプローラー / Chromium 系ブラウザのショートカットに変換
 //       エクスプローラー: 戻る = Alt+← / 進む = Alt+→ / 上の階層 = Alt+↑ / 開く = Enter
 //       Chromium 系: 戻る = Alt+← / 進む = Alt+→ (履歴移動のみ)
 //  2) カーソル共有の参加者 → 合図でカーソルを受け取り、自分の画面で再現する。
 //     隣がいる端を越えたら次の相手へ中継し、来た相手の側の端を越えたら返す。
-// 設定は FinderSwipePeer.ini (この exe と同じフォルダ) に書く:
+// 設定は OneManCursor.ini (この exe と同じフォルダ) に書く:
 //   name=表示名 / left=左隣のID / right=右隣のID / up= / down= / id=自分のID(自動生成)
 
 using System;
@@ -154,7 +154,13 @@ internal static class Program
     private static void LoadConfig()
     {
         string dir = AppDomain.CurrentDomain.BaseDirectory;
-        string path = Path.Combine(dir, "FinderSwipePeer.ini");
+        string path = Path.Combine(dir, "OneManCursor.ini");
+        // 旧名(FinderSwipePeer.ini)の設定があれば引き継ぐ(ID が変わると Mac 側で別人に見えるため)
+        string oldPath = Path.Combine(dir, "FinderSwipePeer.ini");
+        if (!File.Exists(path) && File.Exists(oldPath))
+        {
+            try { File.Copy(oldPath, path); } catch (Exception) { }
+        }
         Dictionary<string, string> kv = new Dictionary<string, string>();
         if (File.Exists(path))
         {
@@ -172,7 +178,7 @@ internal static class Program
             id = Guid.NewGuid().ToString("N").Substring(0, 8);
             kv["id"] = id;
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("; FinderSwipePeer 設定 (相手のIDは各マシンの表示に合わせて書き換える)");
+            sb.AppendLine("; ワンマンカーソル Windows 設定 (相手のIDは各マシンの表示に合わせて書き換える)");
             foreach (KeyValuePair<string, string> p in kv) sb.AppendLine(p.Key + "=" + p.Value);
             if (!kv.ContainsKey("name")) sb.AppendLine("name=" + Environment.MachineName);
             if (!kv.ContainsKey("left")) sb.AppendLine("left=");
@@ -407,7 +413,7 @@ internal static class Program
         sender = new UdpClient();
         sender.EnableBroadcast = true;
 
-        Console.WriteLine("FinderSwipeReceiver (Windows)");
+        Console.WriteLine("ワンマンカーソル OneManCursor (Windows)");
         Console.WriteLine("  名前: " + myName + " / 自分のID: " + myId);
         Console.WriteLine("  画面: " + ScrW + "x" + ScrH + " (原点 " + ScrX + "," + ScrY + ")");
         foreach (KeyValuePair<string, string> p in neighbor)
