@@ -240,6 +240,7 @@ final class App: NSObject, NSApplicationDelegate {
         refreshMenu()
 
         Engine.shared.onAction = { [weak self] label in
+            self?.flashIcon()
             self?.lastItem.title = "最後の検出： \(label)"
         }
         Engine.shared.onStats = { [weak self] frames, maxFingers in
@@ -267,6 +268,18 @@ final class App: NSObject, NSApplicationDelegate {
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
         ucItem.state = Engine.shared.ucMode ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
+    }
+
+    var flashRestore: DispatchWorkItem?
+
+    /// 検知した瞬間に、メニューバーのアイコンを一瞬薄くして知らせる
+    func flashIcon() {
+        guard let button = item.button else { return }
+        flashRestore?.cancel()
+        button.alphaValue = 0.25
+        let work = DispatchWorkItem { [weak self] in self?.item.button?.alphaValue = 1.0 }
+        flashRestore = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
     }
 
     @objc func toggleEnabled() {
