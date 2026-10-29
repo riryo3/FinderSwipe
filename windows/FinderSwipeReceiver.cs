@@ -1,90 +1,323 @@
-// FinderSwipeReceiver (試作)
-// Mac 側の FinderSwipe から届く「合図」(UDP ブロードキャスト)を受けて、
-// アプリごとのショートカットに変換して送る Windows 用の受け専用プログラム。
-//   エクスプローラー: 戻る = Alt+← / 進む = Alt+→ / 上の階層 = Alt+↑ / 開く = Enter
-//   Chrome などの Chromium 系: 戻る = Alt+← / 進む = Alt+→ (履歴移動。それ以外は対象外)
-// 対応アプリが最前面のときだけ実行する。合図の形式は Mac 版と共通。
+// FinderSwipeReceiver (試作) - Windows 側の参加者
+// Mac 側の FinderSwipe と合図(UDP ブロードキャスト)をやり取りする。
+// 役割は2つ:
+//  1) スワイプの合図 → エクスプローラー / Chromium 系ブラウザのショートカットに変換
+//       エクスプローラー: 戻る = Alt+← / 進む = Alt+→ / 上の階層 = Alt+↑ / 開く = Enter
+//       Chromium 系: 戻る = Alt+← / 進む = Alt+→ (履歴移動のみ)
+//  2) カーソル共有の参加者 → 合図でカーソルを受け取り、自分の画面で再現する。
+//     隣がいる端を越えたら次の相手へ中継し、来た相手の側の端を越えたら返す。
+// 設定は FinderSwipePeer.ini (この exe と同じフォルダ) に書く:
+//   name=表示名 / left=左隣のID / right=右隣のID / up= / down= / id=自分のID(自動生成)
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 internal static class Program
 {
     private const int Port = 45987;
     private const string Magic = "FSWIPE1 ";
-    private static readonly Dictionary<long, DateTime> Seen = new Dictionary<long, DateTime>();
 
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
+    // ---- 設定と自分の情報 ----
+    private static string myId;
+    private static string myName;
+    private static readonly Dictionary<string, string> neighbor = new Dictionary<string, string>(); // "left" など → 相手のID
+    private static readonly Dictionary<long, DateTime> seenActions = new Dictionary<long, DateTime>();
+    private static readonly Dictionary<string, string> peers = new Dictionary<string, string>();
+    private static long fastSeq = 0;
+    private static UdpClient sender;
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
+    // ---- カーソル共有の状態 ----
+    private static bool holding = false;
+    private static string cameFrom = null;
+    private static string forwardTo = null;
+    private static double vx = 0, vy = 0;
 
-    [DllImport("user32.dll")]
-    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    // ---- user32 ----
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
+    [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct INPUT
-    {
-        public uint type;
-        public INPUTUNION u;
-    }
+    private struct INPUT { public uint type; public INPUTUNION u; }
 
     [StructLayout(LayoutKind.Explicit, Size = 32)]
     private struct INPUTUNION
     {
         [FieldOffset(0)] public KEYBDINPUT ki;
+        [FieldOffset(0)] public MOUSEINPUT mi;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct KEYBDINPUT
-    {
-        public ushort wVk;
-        public ushort wScan;
-        public uint dwFlags;
-        public uint time;
-        public IntPtr dwExtraInfo;
-    }
+    private struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
 
     private const uint INPUT_KEYBOARD = 1;
+    private const uint INPUT_MOUSE = 0;
     private const uint KEYEVENTF_KEYUP = 0x0002;
-    private const ushort VK_MENU = 0x12;   // Alt
-    private const ushort VK_LEFT = 0x25;
-    private const ushort VK_UP = 0x26;
-    private const ushort VK_RIGHT = 0x27;
-    private const ushort VK_RETURN = 0x0D;
+    private const ushort VK_MENU = 0x12;
+    private const ushort VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_RETURN = 0x0D;
+    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
+    private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008, MOUSEEVENTF_RIGHTUP = 0x0010;
+    private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020, MOUSEEVENTF_MIDDLEUP = 0x0040;
+    private const uint MOUSEEVENTF_WHEEL = 0x0800;
 
+    // 画面全体の外形(仮想スクリーン)
+    private static int ScrX { get { return GetSystemMetrics(76); } }
+    private static int ScrY { get { return GetSystemMetrics(77); } }
+    private static int ScrW { get { return GetSystemMetrics(78); } }
+    private static int ScrH { get { return GetSystemMetrics(79); } }
+
+    // ---- 入力の合成 ----
     private static INPUT MakeKey(ushort vk, bool keyUp)
     {
         INPUT i = new INPUT();
         i.type = INPUT_KEYBOARD;
         i.u.ki.wVk = vk;
-        i.u.ki.wScan = 0;
         i.u.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
-        i.u.ki.time = 0;
-        i.u.ki.dwExtraInfo = IntPtr.Zero;
         return i;
     }
 
-    private static void SendKeys(params INPUT[] inputs)
+    private static INPUT MakeMouse(uint flags, int data)
+    {
+        INPUT i = new INPUT();
+        i.type = INPUT_MOUSE;
+        i.u.mi.dwFlags = flags;
+        i.u.mi.mouseData = unchecked((uint)data);
+        return i;
+    }
+
+    private static void SendInputs(params INPUT[] inputs)
     {
         SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 
     private static void AltCombo(ushort vk)
     {
-        SendKeys(MakeKey(VK_MENU, false), MakeKey(vk, false), MakeKey(vk, true), MakeKey(VK_MENU, true));
+        SendInputs(MakeKey(VK_MENU, false), MakeKey(vk, false), MakeKey(vk, true), MakeKey(VK_MENU, true));
     }
 
-    private static void Press(ushort vk)
+    private static void PressKey(ushort vk) { SendInputs(MakeKey(vk, false), MakeKey(vk, true)); }
+
+    // ---- 合図の送信 ----
+    private static void SendRaw(string body)
     {
-        SendKeys(MakeKey(vk, false), MakeKey(vk, true));
+        byte[] data = Encoding.UTF8.GetBytes(Magic + myId + " " + Interlocked.Increment(ref fastSeq) + " " + body);
+        try { sender.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, Port)); }
+        catch (Exception) { /* 送れなくても落とさない */ }
     }
 
+    private static void SendFast(string body) { SendRaw(body); }
+
+    private static void SendHello()
+    {
+        byte[] data = Encoding.UTF8.GetBytes(Magic + myId + " 0 hello " + myName);
+        try { sender.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, Port)); }
+        catch (Exception) { }
+    }
+
+    // ---- 設定ファイル ----
+    private static void LoadConfig()
+    {
+        string dir = AppDomain.CurrentDomain.BaseDirectory;
+        string path = Path.Combine(dir, "FinderSwipePeer.ini");
+        Dictionary<string, string> kv = new Dictionary<string, string>();
+        if (File.Exists(path))
+        {
+            foreach (string line in File.ReadAllLines(path))
+            {
+                string t = line.Trim();
+                if (t.Length == 0 || t.StartsWith(";") || t.StartsWith("#")) continue;
+                int eq = t.IndexOf('=');
+                if (eq > 0) kv[t.Substring(0, eq).Trim().ToLower()] = t.Substring(eq + 1).Trim();
+            }
+        }
+        string id;
+        if (!kv.TryGetValue("id", out id) || id.Length == 0)
+        {
+            id = Guid.NewGuid().ToString("N").Substring(0, 8);
+            kv["id"] = id;
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("; FinderSwipePeer 設定 (相手のIDは各マシンの表示に合わせて書き換える)");
+            foreach (KeyValuePair<string, string> p in kv) sb.AppendLine(p.Key + "=" + p.Value);
+            if (!kv.ContainsKey("name")) sb.AppendLine("name=" + Environment.MachineName);
+            if (!kv.ContainsKey("left")) sb.AppendLine("left=");
+            if (!kv.ContainsKey("right")) sb.AppendLine("right=");
+            try { File.WriteAllText(path, sb.ToString()); } catch (Exception) { }
+        }
+        myId = id;
+        string nm;
+        myName = kv.TryGetValue("name", out nm) && nm.Length > 0 ? nm : Environment.MachineName;
+        foreach (string d in new string[] { "left", "right", "up", "down" })
+        {
+            string v;
+            if (kv.TryGetValue(d, out v) && v.Length > 0) neighbor[d] = v;
+        }
+    }
+
+    private static string DirOf(string id)
+    {
+        foreach (KeyValuePair<string, string> p in neighbor) if (p.Value == id) return p.Key;
+        return null;
+    }
+
+    private static string PeerName(string id)
+    {
+        string n;
+        return peers.TryGetValue(id, out n) ? n : "相手";
+    }
+
+    // ---- カーソル共有 ----
+    private static void PositionAtEdge(string dir, double ratio)
+    {
+        if (dir == "right") { vx = ScrX + ScrW - 1; vy = ScrY + ratio * ScrH; }
+        else if (dir == "left") { vx = ScrX; vy = ScrY + ratio * ScrH; }
+        else if (dir == "down") { vy = ScrY + ScrH - 1; vx = ScrX + ratio * ScrW; }
+        else { vy = ScrY; vx = ScrX + ratio * ScrW; } // up
+        Warp();
+    }
+
+    private static void Warp() { SetCursorPos((int)vx, (int)vy); }
+
+    private static bool Cross(string dir, double ratio)
+    {
+        string next;
+        if (!neighbor.TryGetValue(dir, out next)) return false;
+        if (next == cameFrom)
+        {
+            SendFast("leave " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            holding = false;
+            cameFrom = null;
+            Console.WriteLine("カーソル共有: 手元に返しました");
+        }
+        else
+        {
+            SendFast("enter " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            forwardTo = next;
+            holding = false;
+            Console.WriteLine("カーソル共有: " + PeerName(next) + " へ渡しました");
+        }
+        return true;
+    }
+
+    private static void ApplyCursor(string kind, string[] args)
+    {
+        if (kind == "mv")
+        {
+            double dx, dy;
+            if (args.Length < 2 || !double.TryParse(args[0], out dx) || !double.TryParse(args[1], out dy)) return;
+            vx += dx; vy += dy;
+            double ry = (vy - ScrY) / ScrH;
+            double rx = (vx - ScrX) / ScrW;
+            if (vx >= ScrX + ScrW && Cross("right", ry)) return;
+            if (vx < ScrX && Cross("left", ry)) return;
+            if (vy >= ScrY + ScrH && Cross("down", rx)) return;
+            if (vy < ScrY && Cross("up", rx)) return;
+            if (vx < ScrX) vx = ScrX;
+            if (vx > ScrX + ScrW - 1) vx = ScrX + ScrW - 1;
+            if (vy < ScrY) vy = ScrY;
+            if (vy > ScrY + ScrH - 1) vy = ScrY + ScrH - 1;
+            Warp();
+        }
+        else if (kind == "dn" || kind == "up")
+        {
+            int b;
+            if (args.Length < 1 || !int.TryParse(args[0], out b)) return;
+            bool down = kind == "dn";
+            uint f = b == 1 ? (down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP)
+                   : b == 2 ? (down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP)
+                   : (down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
+            SendInputs(MakeMouse(f, 0));
+        }
+        else if (kind == "sc")
+        {
+            int dy;
+            if (args.Length < 2 || !int.TryParse(args[0], out dy)) return;
+            SendInputs(MakeMouse(MOUSEEVENTF_WHEEL, dy * 6)); // 倍率は感触に合わせて調整
+        }
+        else if (kind == "kd" || kind == "ku")
+        {
+            int code;
+            if (args.Length < 2 || !int.TryParse(args[0], out code)) return;
+            ushort vk;
+            if (MacKeyToVK.TryGetValue(code, out vk)) SendInputs(MakeKey(vk, kind == "ku"));
+        }
+        else if (kind == "fl")
+        {
+            int code; long flags;
+            if (args.Length < 2 || !int.TryParse(args[0], out code) || !long.TryParse(args[1], out flags)) return;
+            long bit = code == 56 || code == 60 ? 0x20000L
+                     : code == 59 || code == 62 ? 0x40000L
+                     : code == 58 || code == 61 ? 0x80000L
+                     : code == 55 || code == 54 ? 0x100000L : 0L;
+            ushort vk;
+            if (bit != 0 && MacKeyToVK.TryGetValue(code, out vk))
+                SendInputs(MakeKey(vk, (flags & bit) == 0));
+        }
+    }
+
+    private static void ReceiveCursor(string kind, string[] rest, string from)
+    {
+        // rest[0] は宛先ID
+        if (rest.Length < 1 || rest[0] != myId) return;
+        string[] args = new string[rest.Length - 1];
+        Array.Copy(rest, 1, args, 0, args.Length);
+
+        if (kind == "enter")
+        {
+            if (holding || forwardTo != null || args.Length < 1) return;
+            double ratio;
+            if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
+            holding = true;
+            cameFrom = from;
+            string d = DirOf(from);
+            if (d != null) PositionAtEdge(d, ratio);
+            Console.WriteLine("カーソル共有: " + PeerName(from) + " から受け取りました");
+        }
+        else if (kind == "leave")
+        {
+            if (forwardTo == from && args.Length >= 1)
+            {
+                double ratio;
+                if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
+                forwardTo = null;
+                holding = true; // cameFrom は元の相手のまま
+                string d = DirOf(from);
+                if (d != null) PositionAtEdge(d, ratio);
+                Console.WriteLine("カーソル共有: 戻ってきました");
+            }
+        }
+        else
+        {
+            if (holding) ApplyCursor(kind, args);
+            else if (forwardTo != null) SendFast(kind + " " + forwardTo + " " + string.Join(" ", args));
+        }
+    }
+
+    // Mac のキーコード → Windows の仮想キーコード(主なものだけ)
+    private static readonly Dictionary<int, ushort> MacKeyToVK = new Dictionary<int, ushort>
+    {
+        {0,0x41},{1,0x53},{2,0x44},{3,0x46},{4,0x48},{5,0x47},{6,0x5A},{7,0x58},{8,0x43},{9,0x56},
+        {11,0x42},{12,0x51},{13,0x57},{14,0x45},{15,0x52},{16,0x59},{17,0x54},{31,0x4F},{32,0x55},
+        {34,0x49},{35,0x50},{37,0x4C},{38,0x4A},{40,0x4B},{45,0x4E},{46,0x4D},
+        {18,0x31},{19,0x32},{20,0x33},{21,0x34},{23,0x35},{22,0x36},{26,0x37},{28,0x38},{25,0x39},{29,0x30},
+        {49,0x20},{36,0x0D},{53,0x1B},{48,0x09},{51,0x08},{117,0x2E},{115,0x24},{119,0x23},{116,0x21},{121,0x22},
+        {123,0x25},{124,0x27},{125,0x28},{126,0x26},
+        {33,0xDB},{30,0xDD},{41,0xBA},{39,0xDE},{43,0xBC},{47,0xBE},{44,0xBF},{42,0xDC},{27,0xBD},{24,0xBB},{50,0xC0},
+        {122,0x70},{120,0x71},{99,0x72},{118,0x73},{96,0x74},{97,0x75},{98,0x76},{100,0x77},{101,0x78},{109,0x79},{103,0x7A},{111,0x7B},
+        {57,0x14},{55,0x5B},{54,0x5B},{56,0x10},{60,0x10},{58,0x12},{61,0x12},{59,0x11},{62,0x11},
+    };
+
+    // ---- スワイプの合図 ----
     private enum Foreground { None, Explorer, Chromium }
 
     private static Foreground ForegroundKind()
@@ -93,60 +326,102 @@ internal static class Program
         GetClassName(GetForegroundWindow(), sb, sb.Capacity);
         string cls = sb.ToString();
         if (cls == "CabinetWClass" || cls == "ExploreWClass") return Foreground.Explorer;
-        // Chrome / Edge など Chromium 系は全部このクラス名になる
         if (cls == "Chrome_WidgetWin_1") return Foreground.Chromium;
         return Foreground.None;
     }
 
-    private static void Act(string action)
+    private static void ActSwipe(string action)
     {
         switch (action)
         {
             case "back": AltCombo(VK_LEFT); break;
             case "forward": AltCombo(VK_RIGHT); break;
             case "parent": AltCombo(VK_UP); break;
-            case "open": Press(VK_RETURN); break;
+            case "open": PressKey(VK_RETURN); break;
             default: return;
         }
         Console.WriteLine("実行: " + action);
     }
 
+    private static void ReceiveSwipe(string action, long seq)
+    {
+        DateTime now = DateTime.UtcNow;
+        DateTime seenAt;
+        if (seenActions.TryGetValue(seq, out seenAt) && (now - seenAt).TotalSeconds < 2) return;
+        seenActions[seq] = now;
+
+        Foreground kind = ForegroundKind();
+        if (kind == Foreground.None)
+        {
+            Console.WriteLine("受信: " + action + " (対応アプリが最前面ではないので実行しません)");
+            return;
+        }
+        if (kind == Foreground.Chromium && action != "back" && action != "forward")
+        {
+            Console.WriteLine("受信: " + action + " (Chromium 系では履歴移動だけ対応)");
+            return;
+        }
+        Console.WriteLine("受信: " + action);
+        ActSwipe(action);
+    }
+
     private static void Main()
     {
-        Console.WriteLine("FinderSwipeReceiver: UDP " + Port + " で合図を待っています (Ctrl+C で終了)");
+        LoadConfig();
+        sender = new UdpClient();
+        sender.EnableBroadcast = true;
+
+        Console.WriteLine("FinderSwipeReceiver (Windows)");
+        Console.WriteLine("  名前: " + myName + " / 自分のID: " + myId);
+        Console.WriteLine("  画面: " + ScrW + "x" + ScrH + " (原点 " + ScrX + "," + ScrY + ")");
+        foreach (KeyValuePair<string, string> p in neighbor)
+            Console.WriteLine("  隣 (" + p.Key + "): " + p.Value);
+        Console.WriteLine("  UDP " + Port + " で合図を待っています (Ctrl+C で終了)");
+        Console.WriteLine("  ※ Mac 側のレイアウト設定で、この ID を相手として置いてください");
+
+        Thread helloThread = new Thread(() =>
+        {
+            while (true) { SendHello(); Thread.Sleep(5000); }
+        });
+        helloThread.IsBackground = true;
+        helloThread.Start();
+
         UdpClient udp = new UdpClient(Port);
-        IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+        IPEndPoint fromEp = new IPEndPoint(IPAddress.Any, 0);
         while (true)
         {
-            byte[] data = udp.Receive(ref from);
+            byte[] data = udp.Receive(ref fromEp);
             string s = Encoding.UTF8.GetString(data);
             if (!s.StartsWith(Magic)) continue;
-            // 形式: FSWIPE1 <送信元ID> <連番> <アクション> (カーソル共有の合図は要素が多く、ここでは読み飛ばす)
+            // 形式: FSWIPE1 <送信元ID> <連番> <種類> [引数...]
             string[] parts = s.Substring(Magic.Length).Split(' ');
-            if (parts.Length != 3) continue;
-            long seq;
-            if (!long.TryParse(parts[1], out seq)) continue;
-            string action = parts[2];
+            if (parts.Length < 3) continue;
+            string from = parts[0];
+            if (from == myId) continue;
+            string kind = parts[2];
+            string[] rest = new string[parts.Length - 3];
+            Array.Copy(parts, 3, rest, 0, rest.Length);
 
-            // 同じ合図は3回送られてくるので、2秒以内の重複は捨てる
-            DateTime now = DateTime.UtcNow;
-            DateTime seenAt;
-            if (Seen.TryGetValue(seq, out seenAt) && (now - seenAt).TotalSeconds < 2) continue;
-            Seen[seq] = now;
-
-            Foreground kind = ForegroundKind();
-            if (kind == Foreground.None)
+            if (kind == "hello")
             {
-                Console.WriteLine("受信: " + action + " (対応アプリが最前面ではないので実行しません)");
+                string name = string.Join(" ", rest);
+                if (!peers.ContainsKey(from)) Console.WriteLine("相方を発見: " + name + " (ID: " + from + ")");
+                peers[from] = name.Length > 0 ? name : "Mac";
                 continue;
             }
-            if (kind == Foreground.Chromium && action != "back" && action != "forward")
+            if (kind == "reset")
             {
-                Console.WriteLine("受信: " + action + " (Chromium 系では履歴移動だけ対応)");
+                holding = false; cameFrom = null; forwardTo = null;
+                Console.WriteLine("カーソル共有: リセットされました");
                 continue;
             }
-            Console.WriteLine("受信: " + action);
-            Act(action);
+            if (kind == "back" || kind == "forward" || kind == "parent" || kind == "open")
+            {
+                long seq;
+                if (parts.Length == 3 && long.TryParse(parts[1], out seq)) ReceiveSwipe(kind, seq);
+                continue;
+            }
+            ReceiveCursor(kind, rest, from);
         }
     }
 }

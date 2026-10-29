@@ -212,6 +212,25 @@ enum LinkNet {
     private static var seenSeqs: [UInt64: Double] = [:]
     private static var fastSeq: UInt64 = 0
 
+    /// 発見した相方(id → 名前と最終確認時刻)
+    private(set) static var peers: [String: (name: String, seen: Date)] = [:]
+
+    /// 名乗りを送り始める(レイアウト設定で相方を見つけるため)
+    static func startHello() {
+        hello()
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in hello() }
+    }
+
+    private static func hello() {
+        let name = Host.current().localizedName ?? "Mac"
+        udpSend(magic + "\(machineID) 0 hello \(name)")
+    }
+
+    /// カーソル共有セッションの全体リセット
+    static func sendReset() {
+        udpSend(magic + "\(machineID) 0 reset")
+    }
+
     /// 自分の識別子(自分の送った合図を自分で受けないため)
     static let machineID: String = {
         if let s = UserDefaults.standard.string(forKey: "machineID") { return s }
@@ -283,6 +302,15 @@ enum LinkNet {
                 let parts = s.dropFirst(magic.count).split(separator: " ")
                 guard parts.count >= 3, String(parts[0]) != machineID, let seq = UInt64(parts[1]) else { continue }
                 let kind = String(parts[2])
+                if kind == "hello" {
+                    let name = parts.dropFirst(3).joined(separator: " ")
+                    peers[String(parts[0])] = (name.isEmpty ? "Mac" : name, Date())
+                    continue
+                }
+                if kind == "reset" {
+                    CursorShare.shared.resetSession()
+                    continue
+                }
                 if SwipeAction.fromWire(kind) != nil {
                     // スワイプの合図: 3回送られてくる同じものは1回だけ実行する
                     let now = Date().timeIntervalSince1970
@@ -291,8 +319,8 @@ enum LinkNet {
                     seenSeqs = seenSeqs.filter { now - $0.value < 10 }
                     Engine.shared.receiveLink(kind)
                 } else {
-                    // カーソル共有の合図
-                    CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) })
+                    // カーソル共有の合図(送信元IDも渡す)
+                    CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) }, from: String(parts[0]))
                 }
             }
         }
@@ -305,31 +333,58 @@ func cursorTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent
     CursorShare.shared.handle(type: type, event: event)
 }
 
-/// 相方がいる方向(画面レイアウト)。両方の Mac で向かい合うように設定する
+/// 相方がいる方向。レイアウトは「方向 → 相方のマシンID」で持ち、3台以上でも数珠つなぎに渡せる
 enum PartnerDir: String {
     case right, left, up, down
 }
 
-/// カーソル共有の試作。相方のいる方向の端にカーソルが触れたら操作を相方に渡す。
-/// 送り側はイベントタップでマウスとキーを横取りして合図に変換し、
-/// 受け側は合図から合成イベントを作って自分の画面で再現する。
-/// 受け側でカーソルが左端を越えたら手元に返る。送信中に Esc を押しても返る(非常口)。
+/// カーソル共有の試作。
+/// 起点の Mac はイベントタップでマウスとキーを横取りし、宛先付きの合図に変えて送る。
+/// 受けた Mac は自分の画面で再現し、さらに隣がいる端を越えたら次の相手へ中継する。
+/// Esc は非常口: 起点ではセッション終了、参加者では全体リセットを合図する。
 final class CursorShare {
     static let shared = CursorShare()
     var enabled = UserDefaults.standard.bool(forKey: "cursorShare")
-    var partnerDir: PartnerDir {
-        didSet { UserDefaults.standard.set(partnerDir.rawValue, forKey: "partnerDir") }
-    }
     var onStatus: ((String) -> Void)?
 
-    private init() {
-        partnerDir = PartnerDir(rawValue: UserDefaults.standard.string(forKey: "partnerDir") ?? "right") ?? .right
-    }
+    /// 方向 → 相方のマシンID
+    private(set) var neighbors: [PartnerDir: String] = [:]
+
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
-    private(set) var sending = false
-    private(set) var receiving = false
+    // セッションの状態(同時に1つだけ)
+    private var sending = false      // 自分が起点(タップで入力を横取り中)
+    private var awayTo: String?      // 起点のとき: カーソルを渡している相手
+    private var holding = false      // カーソルが自分の画面にある(他機起点)
+    private var cameFrom: String?    // 保持者のとき: 渡してきた相手
+    private var forwardTo: String?   // 中継中: さらに先の相手
     private var vx: Double = 0, vy: Double = 0
+
+    private init() {
+        for dir in [PartnerDir.right, .left, .up, .down] {
+            if let id = UserDefaults.standard.string(forKey: "neighbor_" + dir.rawValue) {
+                neighbors[dir] = id
+            }
+        }
+    }
+
+    func setNeighbor(_ dir: PartnerDir, id: String?) {
+        neighbors[dir] = id
+        let key = "neighbor_" + dir.rawValue
+        if let id = id {
+            UserDefaults.standard.set(id, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    func dir(ofPeer id: String) -> PartnerDir? {
+        neighbors.first { $0.value == id }?.key
+    }
+
+    private func peerName(_ id: String) -> String {
+        LinkNet.peers[id]?.name ?? "相手"
+    }
 
     /// 全ディスプレイの外形(複数ディスプレイはこの外形で近似する)
     private var allBounds: CGRect {
@@ -349,11 +404,21 @@ final class CursorShare {
         if on {
             installTap()
         } else {
-            endSending(notify: true)
-            receiving = false
+            LinkNet.sendReset()
+            resetSession()
             removeTap()
         }
     }
+
+    func resetSession() {
+        sending = false
+        awayTo = nil
+        holding = false
+        cameFrom = nil
+        forwardTo = nil
+    }
+
+    // MARK: イベントタップ(起点と、参加中の物理入力の扱い)
 
     func installTap() {
         guard tap == nil else { return }
@@ -384,128 +449,201 @@ final class CursorShare {
         tapSource = nil
     }
 
+    private func isMove(_ t: CGEventType) -> Bool {
+        t == .mouseMoved || t == .leftMouseDragged || t == .rightMouseDragged || t == .otherMouseDragged
+    }
+
+    private func isMouse(_ t: CGEventType) -> Bool {
+        isMove(t) || t == .leftMouseDown || t == .leftMouseUp || t == .rightMouseDown || t == .rightMouseUp
+            || t == .otherMouseDown || t == .otherMouseUp || t == .scrollWheel
+    }
+
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
-        guard enabled, !receiving else { return Unmanaged.passUnretained(event) }
-        if !sending {
-            // 相方のいる方向の端に触れたら開始する
-            if type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged {
-                let b = allBounds
-                let loc = event.location
-                let hit: Bool
-                let ratio: Double
-                switch partnerDir {
-                case .right: hit = loc.x >= b.maxX - 1; ratio = Double((loc.y - b.minY) / b.height)
-                case .left: hit = loc.x <= b.minX; ratio = Double((loc.y - b.minY) / b.height)
-                case .down: hit = loc.y >= b.maxY - 1; ratio = Double((loc.x - b.minX) / b.width)
-                case .up: hit = loc.y <= b.minY; ratio = Double((loc.x - b.minX) / b.width)
-                }
-                if hit {
-                    beginSending(ratio: ratio)
-                    return nil
-                }
+        guard enabled else { return Unmanaged.passUnretained(event) }
+        let isEsc = type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 53
+
+        // 他機起点のセッションに参加中(保持者・中継者): 物理マウスは位置がずれるので飲む。Esc で全体リセット
+        if holding || forwardTo != nil {
+            if isEsc {
+                LinkNet.sendReset()
+                resetSession()
+                status("カーソル共有： リセットしました")
+                return nil
             }
+            if isMouse(type) { return nil }
             return Unmanaged.passUnretained(event)
         }
-        // 送信中: Esc は非常口(合図にせず、その場で手元に戻す)
-        if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53 {
-            endSending(notify: true)
+
+        // 自分が起点
+        if sending {
+            if awayTo == nil {
+                // カーソルは手元にある: 通常どおり通しつつ、端を監視する
+                if isMove(type), checkEdges(event) { return nil }
+                return Unmanaged.passUnretained(event)
+            }
+            // カーソルは相手側: Esc で終了、それ以外は合図に変えて飲む
+            if isEsc {
+                LinkNet.sendReset()
+                resetSession()
+                status("カーソル共有： 終了しました")
+                return nil
+            }
+            forwardPhysical(type: type, event: event, to: awayTo!)
             return nil
         }
+
+        // 待機中: 端に触れたらセッション開始
+        if isMove(type), checkEdges(event) { return nil }
+        return Unmanaged.passUnretained(event)
+    }
+
+    /// 端に触れていたら相手に渡す。渡したら true
+    private func checkEdges(_ event: CGEvent) -> Bool {
+        let b = allBounds
+        let loc = event.location
+        let checks: [(PartnerDir, Bool, Double)] = [
+            (.right, loc.x >= b.maxX - 1, Double((loc.y - b.minY) / b.height)),
+            (.left, loc.x <= b.minX, Double((loc.y - b.minY) / b.height)),
+            (.down, loc.y >= b.maxY - 1, Double((loc.x - b.minX) / b.width)),
+            (.up, loc.y <= b.minY, Double((loc.x - b.minX) / b.width)),
+        ]
+        for (dir, hit, ratio) in checks where hit {
+            guard let next = neighbors[dir] else { continue }
+            sending = true
+            awayTo = next
+            for _ in 0..<3 { LinkNet.sendFast("enter \(next) \(ratio)") }
+            status("カーソル共有： \(peerName(next)) に渡しました")
+            return true
+        }
+        return false
+    }
+
+    /// 起点の物理入力を合図に変える
+    private func forwardPhysical(type: CGEventType, event: CGEvent, to: String) {
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             let dx = event.getIntegerValueField(.mouseEventDeltaX)
             let dy = event.getIntegerValueField(.mouseEventDeltaY)
-            if dx != 0 || dy != 0 { LinkNet.sendFast("mv \(dx) \(dy)") }
+            if dx != 0 || dy != 0 { LinkNet.sendFast("mv \(to) \(dx) \(dy)") }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            LinkNet.sendFast("dn \(event.getIntegerValueField(.mouseEventButtonNumber))")
+            LinkNet.sendFast("dn \(to) \(event.getIntegerValueField(.mouseEventButtonNumber))")
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
-            LinkNet.sendFast("up \(event.getIntegerValueField(.mouseEventButtonNumber))")
+            LinkNet.sendFast("up \(to) \(event.getIntegerValueField(.mouseEventButtonNumber))")
         case .scrollWheel:
             let dy = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
             let dx = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
-            if dx != 0 || dy != 0 { LinkNet.sendFast("sc \(Int(dy)) \(Int(dx))") }
+            if dx != 0 || dy != 0 { LinkNet.sendFast("sc \(to) \(Int(dy)) \(Int(dx))") }
         case .keyDown:
-            LinkNet.sendFast("kd \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
+            LinkNet.sendFast("kd \(to) \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
         case .keyUp:
-            LinkNet.sendFast("ku \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
+            LinkNet.sendFast("ku \(to) \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
         case .flagsChanged:
-            LinkNet.sendFast("fl \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
+            LinkNet.sendFast("fl \(to) \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
         default:
-            return Unmanaged.passUnretained(event)
+            break
         }
-        return nil
     }
 
-    private func beginSending(ratio: Double) {
-        sending = true
-        for _ in 0..<3 { LinkNet.sendFast("enter \(ratio)") }  // 大事な合図なので3回送る
-        status("カーソル共有： 相手に渡しました")
-    }
+    // MARK: 受け側(LinkNet から呼ばれる。args の先頭は宛先ID)
 
-    func endSending(notify: Bool) {
-        guard sending else { return }
-        sending = false
-        if notify { LinkNet.sendFast("leave") }
-        status("カーソル共有： 手元に戻りました")
-    }
-
-    /// 受け側: LinkNet から呼ばれる
-    func receive(_ kind: String, args: [String]) {
-        guard enabled else { return }
-        let b = allBounds
+    func receive(_ kind: String, args: [String], from: String) {
+        guard enabled, let to = args.first, to == LinkNet.machineID else { return }
+        let rest = Array(args.dropFirst())
         switch kind {
         case "enter":
-            guard !sending else { return }
-            receiving = true
-            let ratio = args.first.flatMap { Double($0) } ?? 0.5
-            // 相方(送り側)がいる方向の端から入ってくる
-            switch partnerDir {
-            case .right: vx = Double(b.maxX) - 1; vy = Double(b.minY) + ratio * Double(b.height)
-            case .left: vx = Double(b.minX); vy = Double(b.minY) + ratio * Double(b.height)
-            case .down: vy = Double(b.maxY) - 1; vx = Double(b.minX) + ratio * Double(b.width)
-            case .up: vy = Double(b.minY); vx = Double(b.minX) + ratio * Double(b.width)
-            }
+            guard !sending, !holding, forwardTo == nil, rest.count >= 1 else { return }
+            holding = true
+            cameFrom = from
+            let ratio = Double(rest[0]) ?? 0.5
+            if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio) }
             warp()
-            status("カーソル共有： 相手から受け取りました")
+            status("カーソル共有： \(peerName(from)) から受け取りました")
         case "leave":
-            if receiving { receiving = false; status("カーソル共有： 相手に戻りました") }
-            if sending { endSending(notify: false) }
+            guard rest.count >= 1 else { return }
+            let ratio = Double(rest[0]) ?? 0.5
+            if awayTo == from {
+                // 起点にカーソルが戻ってきた(セッション自体は継続)
+                awayTo = nil
+                if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio); warp() }
+                status("カーソル共有： 手元に戻りました")
+            } else if forwardTo == from {
+                // 中継していた先から戻ってきた → 自分が保持者になる(cameFrom は元の相手のまま)
+                forwardTo = nil
+                holding = true
+                if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio); warp() }
+                status("カーソル共有： 戻ってきました")
+            }
+        case "mv", "dn", "up", "sc", "kd", "ku", "fl":
+            if holding {
+                apply(kind, args: rest)
+            } else if let fwd = forwardTo {
+                // 中継: 宛先を次の相手に書き換えてそのまま送る
+                LinkNet.sendFast("\(kind) \(fwd) " + rest.joined(separator: " "))
+            }
+        default:
+            break
+        }
+    }
+
+    /// 端の位置に仮想カーソルを置く
+    private func positionAtEdge(_ dir: PartnerDir, ratio: Double) {
+        let b = allBounds
+        switch dir {
+        case .right: vx = Double(b.maxX) - 1; vy = Double(b.minY) + ratio * Double(b.height)
+        case .left: vx = Double(b.minX); vy = Double(b.minY) + ratio * Double(b.height)
+        case .down: vy = Double(b.maxY) - 1; vx = Double(b.minX) + ratio * Double(b.width)
+        case .up: vy = Double(b.minY); vx = Double(b.minX) + ratio * Double(b.width)
+        }
+    }
+
+    /// 端を越えたときの受け渡し・返却。実行したら true
+    private func cross(_ dir: PartnerDir, ratio: Double) -> Bool {
+        guard let next = neighbors[dir] else { return false }
+        if next == cameFrom {
+            LinkNet.sendFast("leave \(next) \(ratio)")
+            holding = false
+            cameFrom = nil
+            status("カーソル共有： 手元に返しました")
+        } else {
+            LinkNet.sendFast("enter \(next) \(ratio)")
+            forwardTo = next
+            holding = false
+            status("カーソル共有： \(peerName(next)) へ渡しました")
+        }
+        return true
+    }
+
+    private func apply(_ kind: String, args: [String]) {
+        let b = allBounds
+        switch kind {
         case "mv":
-            guard receiving, args.count == 2, let dx = Double(args[0]), let dy = Double(args[1]) else { return }
+            guard args.count == 2, let dx = Double(args[0]), let dy = Double(args[1]) else { return }
             vx += dx
             vy += dy
-            // 相方のいる方向の端を越えたら手元に返す
-            let crossed: Bool
-            switch partnerDir {
-            case .right: crossed = vx >= Double(b.maxX)
-            case .left: crossed = vx < Double(b.minX)
-            case .down: crossed = vy >= Double(b.maxY)
-            case .up: crossed = vy < Double(b.minY)
-            }
-            if crossed {
-                receiving = false
-                LinkNet.sendFast("leave")
-                status("カーソル共有： 手元に返しました")
-                return
-            }
+            let ry = (vy - Double(b.minY)) / Double(b.height)
+            let rx = (vx - Double(b.minX)) / Double(b.width)
+            if vx >= Double(b.maxX), cross(.right, ratio: ry) { return }
+            if vx < Double(b.minX), cross(.left, ratio: ry) { return }
+            if vy >= Double(b.maxY), cross(.down, ratio: rx) { return }
+            if vy < Double(b.minY), cross(.up, ratio: rx) { return }
             vx = min(max(vx, Double(b.minX)), Double(b.maxX) - 1)
             vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
             warp()
         case "dn", "up":
-            guard receiving, let n = args.first.flatMap({ Int($0) }) else { return }
+            guard let n = args.first.flatMap({ Int($0) }) else { return }
             postMouse(down: kind == "dn", button: n)
         case "sc":
-            guard receiving, args.count == 2, let dy = Int32(args[0]), let dx = Int32(args[1]) else { return }
+            guard args.count == 2, let dy = Int32(args[0]), let dx = Int32(args[1]) else { return }
             if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) {
                 e.location = CGPoint(x: vx, y: vy)
                 e.post(tap: .cghidEventTap)
             }
         case "kd", "ku", "fl":
-            guard receiving, args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
+            guard args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
             if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: kind != "ku") {
                 e.flags = CGEventFlags(rawValue: flagsRaw)
                 if kind == "fl" { e.type = .flagsChanged }
@@ -585,13 +723,13 @@ func fingerIcon() -> NSImage {
     return img
 }
 
-final class App: NSObject, NSApplicationDelegate {
+final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     var enabledItem: NSMenuItem!
     var remoteItem: NSMenuItem!
     var linkItem: NSMenuItem!
     var cursorItem: NSMenuItem!
-    var dirItems: [NSMenuItem] = []
+    var layoutMenu: NSMenu!
     var tapItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
@@ -609,16 +747,10 @@ final class App: NSObject, NSApplicationDelegate {
         linkItem.target = self
         cursorItem = NSMenuItem(title: "カーソル共有（端で相手に渡す）", action: #selector(toggleCursor), keyEquivalent: "")
         cursorItem.target = self
-        let dirParent = NSMenuItem(title: "相方の位置", action: nil, keyEquivalent: "")
-        let dirMenu = NSMenu()
-        for (title, raw) in [("右", "right"), ("左", "left"), ("上", "up"), ("下", "down")] {
-            let it = NSMenuItem(title: title, action: #selector(setPartnerDir(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = raw
-            dirMenu.addItem(it)
-            dirItems.append(it)
-        }
-        dirParent.submenu = dirMenu
+        let layoutParent = NSMenuItem(title: "レイアウト（相方の配置）", action: nil, keyEquivalent: "")
+        layoutMenu = NSMenu()
+        layoutMenu.delegate = self
+        layoutParent.submenu = layoutMenu
         tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
         tapItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
@@ -629,7 +761,7 @@ final class App: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(dirParent); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(layoutParent); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -657,6 +789,7 @@ final class App: NSObject, NSApplicationDelegate {
         }
 
         LinkNet.startReceiver()
+        LinkNet.startHello()
 
         let devices = Multitouch.start()
         mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： 接続失敗"
@@ -671,9 +804,6 @@ final class App: NSObject, NSApplicationDelegate {
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
         linkItem.state = Engine.shared.linkMode ? .on : .off
         cursorItem.state = CursorShare.shared.enabled ? .on : .off
-        for it in dirItems {
-            it.state = (it.representedObject as? String) == CursorShare.shared.partnerDir.rawValue ? .on : .off
-        }
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
     }
 
@@ -712,11 +842,52 @@ final class App: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
-    @objc func setPartnerDir(_ sender: NSMenuItem) {
-        if let raw = sender.representedObject as? String, let d = PartnerDir(rawValue: raw) {
-            CursorShare.shared.partnerDir = d
+    /// レイアウトメニューは開くたびに、発見済みの相方から作り直す
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu == layoutMenu else { return }
+        menu.removeAllItems()
+        let me = NSMenuItem(title: "この Mac： \(Host.current().localizedName ?? "Mac")（ID: \(LinkNet.machineID)）", action: nil, keyEquivalent: "")
+        me.isEnabled = false
+        menu.addItem(me)
+        menu.addItem(.separator())
+        let peers = LinkNet.peers.sorted { $0.value.name < $1.value.name }
+        if peers.isEmpty {
+            let none = NSMenuItem(title: "相方が見つかっていません（相手でもアプリを起動してください）", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
+            return
         }
-        refreshMenu()
+        for (id, info) in peers {
+            let parent = NSMenuItem(title: info.name, action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for (label, raw) in [("右に置く", "right"), ("左に置く", "left"), ("上に置く", "up"), ("下に置く", "down"), ("外す", "none")] {
+                let it = NSMenuItem(title: label, action: #selector(setNeighborFromMenu(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = "\(raw)|\(id)"
+                if raw == "none" {
+                    it.state = CursorShare.shared.dir(ofPeer: id) == nil ? .on : .off
+                } else if let d = PartnerDir(rawValue: raw) {
+                    it.state = CursorShare.shared.neighbors[d] == id ? .on : .off
+                }
+                sub.addItem(it)
+            }
+            parent.submenu = sub
+            menu.addItem(parent)
+        }
+    }
+
+    @objc func setNeighborFromMenu(_ sender: NSMenuItem) {
+        guard let s = sender.representedObject as? String else { return }
+        let parts = s.split(separator: "|", maxSplits: 1)
+        guard parts.count == 2 else { return }
+        let raw = String(parts[0]), id = String(parts[1])
+        // 同じ相手が別の方向にいたら先に外す(相手は1方向にだけ置く)
+        if let old = CursorShare.shared.dir(ofPeer: id) {
+            CursorShare.shared.setNeighbor(old, id: nil)
+        }
+        if raw != "none", let d = PartnerDir(rawValue: raw) {
+            CursorShare.shared.setNeighbor(d, id: id)
+        }
     }
 
     @objc func toggleTap() {
