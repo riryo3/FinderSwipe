@@ -27,6 +27,7 @@ internal static class Program
     private static string myId;
     private static string myName;
     private static readonly Dictionary<string, string> configKv = new Dictionary<string, string>();
+    private static DateTime holdingSince = DateTime.MinValue;
     private static readonly Dictionary<string, string> neighbor = new Dictionary<string, string>(); // "left" など → 相手のID
     private static readonly Dictionary<long, DateTime> seenActions = new Dictionary<long, DateTime>();
     private static readonly Dictionary<string, string> peers = new Dictionary<string, string>();
@@ -287,10 +288,14 @@ internal static class Program
             vx += dx; vy += dy;
             double ry = (vy - ScrY) / ScrH;
             double rx = (vx - ScrX) / ScrW;
-            if (vx >= ScrX + ScrW && Cross("right", ry)) return;
-            if (vx < ScrX && Cross("left", ry)) return;
-            if (vy >= ScrY + ScrH && Cross("down", rx)) return;
-            if (vy < ScrY && Cross("up", rx)) return;
+            // 保持し始めの300msは端を越えても出ない(入った直後の指の残りで出入りを繰り返すバタつき防止)
+            if ((DateTime.UtcNow - holdingSince).TotalMilliseconds >= 300)
+            {
+                if (vx >= ScrX + ScrW && Cross("right", ry)) return;
+                if (vx < ScrX && Cross("left", ry)) return;
+                if (vy >= ScrY + ScrH && Cross("down", rx)) return;
+                if (vy < ScrY && Cross("up", rx)) return;
+            }
             if (vx < ScrX) vx = ScrX;
             if (vx > ScrX + ScrW - 1) vx = ScrX + ScrW - 1;
             if (vy < ScrY) vy = ScrY;
@@ -347,6 +352,7 @@ internal static class Program
             double ratio;
             if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
             holding = true;
+            holdingSince = DateTime.UtcNow;
             cameFrom = from;
             string d = null;
             if (args.Length > 1)
@@ -367,6 +373,7 @@ internal static class Program
                 if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
                 forwardTo = null;
                 holding = true; // cameFrom は元の相手のまま
+                holdingSince = DateTime.UtcNow;
                 string d = DirOf(from);
                 if (d != null) PositionAtEdge(d, ratio);
                 Console.WriteLine("カーソル共有: 戻ってきました");
