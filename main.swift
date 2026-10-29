@@ -305,21 +305,43 @@ func cursorTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent
     CursorShare.shared.handle(type: type, event: event)
 }
 
-/// カーソル共有の試作。右端にカーソルが触れたら操作を相方に渡す。
+/// 相方がいる方向(画面レイアウト)。両方の Mac で向かい合うように設定する
+enum PartnerDir: String {
+    case right, left, up, down
+}
+
+/// カーソル共有の試作。相方のいる方向の端にカーソルが触れたら操作を相方に渡す。
 /// 送り側はイベントタップでマウスとキーを横取りして合図に変換し、
 /// 受け側は合図から合成イベントを作って自分の画面で再現する。
 /// 受け側でカーソルが左端を越えたら手元に返る。送信中に Esc を押しても返る(非常口)。
 final class CursorShare {
     static let shared = CursorShare()
     var enabled = UserDefaults.standard.bool(forKey: "cursorShare")
+    var partnerDir: PartnerDir {
+        didSet { UserDefaults.standard.set(partnerDir.rawValue, forKey: "partnerDir") }
+    }
     var onStatus: ((String) -> Void)?
+
+    private init() {
+        partnerDir = PartnerDir(rawValue: UserDefaults.standard.string(forKey: "partnerDir") ?? "right") ?? .right
+    }
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private(set) var sending = false
     private(set) var receiving = false
     private var vx: Double = 0, vy: Double = 0
 
-    private var mainBounds: CGRect { CGDisplayBounds(CGMainDisplayID()) }
+    /// 全ディスプレイの外形(複数ディスプレイはこの外形で近似する)
+    private var allBounds: CGRect {
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        guard count > 0 else { return CGDisplayBounds(CGMainDisplayID()) }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetActiveDisplayList(count, &ids, &count)
+        var u = CGDisplayBounds(ids[0])
+        for id in ids.dropFirst() { u = u.union(CGDisplayBounds(id)) }
+        return u
+    }
 
     func setEnabled(_ on: Bool) {
         enabled = on
@@ -369,12 +391,20 @@ final class CursorShare {
         }
         guard enabled, !receiving else { return Unmanaged.passUnretained(event) }
         if !sending {
-            // 右端に触れたら開始する
+            // 相方のいる方向の端に触れたら開始する
             if type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged {
-                let b = mainBounds
+                let b = allBounds
                 let loc = event.location
-                if loc.x >= b.maxX - 1 {
-                    beginSending(yRatio: Double((loc.y - b.minY) / b.height))
+                let hit: Bool
+                let ratio: Double
+                switch partnerDir {
+                case .right: hit = loc.x >= b.maxX - 1; ratio = Double((loc.y - b.minY) / b.height)
+                case .left: hit = loc.x <= b.minX; ratio = Double((loc.y - b.minY) / b.height)
+                case .down: hit = loc.y >= b.maxY - 1; ratio = Double((loc.x - b.minX) / b.width)
+                case .up: hit = loc.y <= b.minY; ratio = Double((loc.x - b.minX) / b.width)
+                }
+                if hit {
+                    beginSending(ratio: ratio)
                     return nil
                 }
             }
@@ -410,9 +440,9 @@ final class CursorShare {
         return nil
     }
 
-    private func beginSending(yRatio: Double) {
+    private func beginSending(ratio: Double) {
         sending = true
-        for _ in 0..<3 { LinkNet.sendFast("enter \(yRatio)") }  // 大事な合図なので3回送る
+        for _ in 0..<3 { LinkNet.sendFast("enter \(ratio)") }  // 大事な合図なので3回送る
         status("カーソル共有： 相手に渡しました")
     }
 
@@ -426,14 +456,19 @@ final class CursorShare {
     /// 受け側: LinkNet から呼ばれる
     func receive(_ kind: String, args: [String]) {
         guard enabled else { return }
-        let b = mainBounds
+        let b = allBounds
         switch kind {
         case "enter":
             guard !sending else { return }
             receiving = true
-            vx = Double(b.minX)
             let ratio = args.first.flatMap { Double($0) } ?? 0.5
-            vy = Double(b.minY) + ratio * Double(b.height)
+            // 相方(送り側)がいる方向の端から入ってくる
+            switch partnerDir {
+            case .right: vx = Double(b.maxX) - 1; vy = Double(b.minY) + ratio * Double(b.height)
+            case .left: vx = Double(b.minX); vy = Double(b.minY) + ratio * Double(b.height)
+            case .down: vy = Double(b.maxY) - 1; vx = Double(b.minX) + ratio * Double(b.width)
+            case .up: vy = Double(b.minY); vx = Double(b.minX) + ratio * Double(b.width)
+            }
             warp()
             status("カーソル共有： 相手から受け取りました")
         case "leave":
@@ -443,14 +478,22 @@ final class CursorShare {
             guard receiving, args.count == 2, let dx = Double(args[0]), let dy = Double(args[1]) else { return }
             vx += dx
             vy += dy
-            vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
-            if vx < Double(b.minX) {
+            // 相方のいる方向の端を越えたら手元に返す
+            let crossed: Bool
+            switch partnerDir {
+            case .right: crossed = vx >= Double(b.maxX)
+            case .left: crossed = vx < Double(b.minX)
+            case .down: crossed = vy >= Double(b.maxY)
+            case .up: crossed = vy < Double(b.minY)
+            }
+            if crossed {
                 receiving = false
                 LinkNet.sendFast("leave")
                 status("カーソル共有： 手元に返しました")
                 return
             }
-            vx = min(vx, Double(b.maxX) - 1)
+            vx = min(max(vx, Double(b.minX)), Double(b.maxX) - 1)
+            vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
             warp()
         case "dn", "up":
             guard receiving, let n = args.first.flatMap({ Int($0) }) else { return }
@@ -548,6 +591,7 @@ final class App: NSObject, NSApplicationDelegate {
     var remoteItem: NSMenuItem!
     var linkItem: NSMenuItem!
     var cursorItem: NSMenuItem!
+    var dirItems: [NSMenuItem] = []
     var tapItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
@@ -563,8 +607,18 @@ final class App: NSObject, NSApplicationDelegate {
         remoteItem.target = self
         linkItem = NSMenuItem(title: "相方モード（ネットワークで合図を送受信）", action: #selector(toggleLink), keyEquivalent: "")
         linkItem.target = self
-        cursorItem = NSMenuItem(title: "カーソル共有（右端で相手に渡す）", action: #selector(toggleCursor), keyEquivalent: "")
+        cursorItem = NSMenuItem(title: "カーソル共有（端で相手に渡す）", action: #selector(toggleCursor), keyEquivalent: "")
         cursorItem.target = self
+        let dirParent = NSMenuItem(title: "相方の位置", action: nil, keyEquivalent: "")
+        let dirMenu = NSMenu()
+        for (title, raw) in [("右", "right"), ("左", "left"), ("上", "up"), ("下", "down")] {
+            let it = NSMenuItem(title: title, action: #selector(setPartnerDir(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = raw
+            dirMenu.addItem(it)
+            dirItems.append(it)
+        }
+        dirParent.submenu = dirMenu
         tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
         tapItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
@@ -575,7 +629,7 @@ final class App: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(dirParent); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -617,6 +671,9 @@ final class App: NSObject, NSApplicationDelegate {
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
         linkItem.state = Engine.shared.linkMode ? .on : .off
         cursorItem.state = CursorShare.shared.enabled ? .on : .off
+        for it in dirItems {
+            it.state = (it.representedObject as? String) == CursorShare.shared.partnerDir.rawValue ? .on : .off
+        }
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
     }
 
@@ -652,6 +709,13 @@ final class App: NSObject, NSApplicationDelegate {
 
     @objc func toggleCursor() {
         CursorShare.shared.setEnabled(!CursorShare.shared.enabled)
+        refreshMenu()
+    }
+
+    @objc func setPartnerDir(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let d = PartnerDir(rawValue: raw) {
+            CursorShare.shared.partnerDir = d
+        }
         refreshMenu()
     }
 
