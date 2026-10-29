@@ -524,7 +524,8 @@ final class CursorShare {
         // 自分が起点
         if sending {
             if awayTo == nil {
-                // カーソルは手元にある: 通常どおり通しつつ、端を監視する
+                // カーソルは手元にある: 通常どおり通しつつ、端を監視する。Esc で自分のセッション状態を掃除する
+                if isEsc { resetSession() }
                 if isMove(type), checkEdges(event) { return nil }
                 return Unmanaged.passUnretained(event)
             }
@@ -598,7 +599,10 @@ final class CursorShare {
         let rest = Array(args.dropFirst())
         switch kind {
         case "enter":
-            guard !sending, !holding, forwardTo == nil, rest.count >= 1 else { return }
+            // 自分が起点でも、カーソルが手元に戻っている状態なら受け取れる(セッションは相手に譲る)。
+            // ここで弾くと「一度送った側には二度と戻せない」非対称な詰まりになる
+            guard awayTo == nil, !holding, forwardTo == nil, rest.count >= 1 else { return }
+            sending = false
             holding = true
             cameFrom = from
             let ratio = Double(rest[0]) ?? 0.5
