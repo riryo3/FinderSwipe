@@ -149,6 +149,10 @@ final class Engine {
         var note = ""
         if !enabled {
             note = "（無効中）"
+        } else if CursorShare.shared.sessionActiveAway {
+            // カーソル共有で相手を操作中なら、スワイプもキー入力として相手に送る
+            CursorShare.shared.forwardActionKey(for: action)
+            note = "（カーソル共有で送信）"
         } else if isFinder {
             postKey(for: action)
         } else if linkMode {
@@ -673,6 +677,7 @@ final class CursorShare {
             guard let self = self, self.awayTo != nil, let p = self.frozenPoint else { return }
             CGWarpMouseCursorPosition(p)
             CGAssociateMouseAndMouseCursorPosition(1)
+            self.hideCursor()
         }
     }
 
@@ -683,19 +688,23 @@ final class CursorShare {
     }
 
     private var cursorHidden = false
+    private var hideCount = 0
 
     /// 操作を渡している間、起点側のカーソルは隠す(見えていると誤タップの元になるため)。
-    /// クリック自体はタップで飲んでいるのでアプリには届かないが、見た目も消しておく
+    /// クリック自体はタップで飲んでいるのでアプリには届かないが、見た目も消しておく。
+    /// 隠す回数を数えておき、戻すときは同じ回数だけ表示する(固定タイマーから何度も隠すため)
     private func hideCursor() {
-        guard !cursorHidden else { return }
-        cursorHidden = true
         for id in activeDisplayIDs() { CGDisplayHideCursor(id) }
+        hideCount += 1
+        cursorHidden = true
     }
 
     private func showCursor() {
-        guard cursorHidden else { return }
+        while hideCount > 0 {
+            for id in activeDisplayIDs() { CGDisplayShowCursor(id) }
+            hideCount -= 1
+        }
         cursorHidden = false
-        for id in activeDisplayIDs() { CGDisplayShowCursor(id) }
     }
 
     private func activeDisplayIDs() -> [CGDirectDisplayID] {
@@ -829,6 +838,26 @@ final class CursorShare {
         // 待機中: 端に触れたらセッション開始
         if isMove(type), checkEdges(event) { return nil }
         return Unmanaged.passUnretained(event)
+    }
+
+    /// 自分が起点で、カーソルが相手側にある状態か
+    var sessionActiveAway: Bool { sending && awayTo != nil }
+
+    /// スワイプのアクションを、相手へのキー入力(⌘付き)として送る
+    func forwardActionKey(for action: SwipeAction) {
+        guard let to = awayTo else { return }
+        let code: Int64
+        switch action {
+        case .back: code = 33
+        case .forward: code = 30
+        case .parent: code = 126
+        case .open: code = 31
+        }
+        let cmd = Int64(CGEventFlags.maskCommand.rawValue)
+        LinkNet.sendFast("fl \(to) 55 \(cmd)")
+        LinkNet.sendFast("kd \(to) \(code) \(cmd)")
+        LinkNet.sendFast("ku \(to) \(code) \(cmd)")
+        LinkNet.sendFast("fl \(to) 55 0")
     }
 
     /// 端に触れていたら相手に渡す。渡したら true
