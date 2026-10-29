@@ -211,6 +211,7 @@ enum LinkNet {
     static let port: UInt16 = 45987
     private static let magic = "FSWIPE1 "
     private static var seenSeqs: [UInt64: Double] = [:]
+    private static var seenFast: [String: Double] = [:]
     private static var fastSeq: UInt64 = 0
     private static var sendFd: Int32 = -1
     private static let sendQueue = DispatchQueue(label: "finderswipe.send")
@@ -302,7 +303,13 @@ enum LinkNet {
                 }
             }
             flushMove()
-            rawSend(body)
+            // キーやクリックなどの「出来事」は落とすと致命的なので、同じ連番で3回送る(受け側で重複を捨てる)
+            fastSeq &+= 1
+            let text = magic + "\(machineID) \(fastSeq) \(body)"
+            udpSend(text)
+            for delay in [0.010, 0.020] {
+                sendQueue.asyncAfter(deadline: .now() + delay) { udpSend(text) }
+            }
         }
     }
 
@@ -363,7 +370,12 @@ enum LinkNet {
                     seenSeqs = seenSeqs.filter { now - $0.value < 10 }
                     Engine.shared.receiveLink(kind)
                 } else {
-                    // カーソル共有の合図(送信元IDも渡す)
+                    // カーソル共有の合図: 重要イベントは3回送られてくるので、同じ連番は1回だけ処理する
+                    let dupKey = "\(parts[0])-\(seq)"
+                    let nowFast = Date().timeIntervalSince1970
+                    if let seen = seenFast[dupKey], nowFast - seen < 2 { continue }
+                    seenFast[dupKey] = nowFast
+                    seenFast = seenFast.filter { nowFast - $0.value < 10 }
                     CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) }, from: String(parts[0]))
                 }
             }
