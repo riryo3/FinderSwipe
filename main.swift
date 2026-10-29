@@ -538,9 +538,17 @@ final class CursorShare {
             || t == .otherMouseDown || t == .otherMouseUp || t == .scrollWheel
     }
 
+    /// 自分が合成したイベントにつける目印(自分のタップで飲まないため)
+    private static let syntheticMarker: Int64 = 0x4653_5750
+
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return Unmanaged.passUnretained(event)
+        }
+        // 自分が合成したイベントは素通しする(保持者として post したクリックやスクロールを、
+        // 自分のタップの「参加中は物理マウスを飲む」ルールで消してしまわないため)
+        if event.getIntegerValueField(.eventSourceUserData) == Self.syntheticMarker {
             return Unmanaged.passUnretained(event)
         }
         guard enabled else { return Unmanaged.passUnretained(event) }
@@ -726,6 +734,7 @@ final class CursorShare {
             guard args.count == 2, let dy = Int32(args[0]), let dx = Int32(args[1]) else { return }
             if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) {
                 e.location = CGPoint(x: vx, y: vy)
+                e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
                 e.post(tap: .cghidEventTap)
             }
         case "kd", "ku", "fl":
@@ -733,6 +742,7 @@ final class CursorShare {
             if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: kind != "ku") {
                 e.flags = CGEventFlags(rawValue: flagsRaw)
                 if kind == "fl" { e.type = .flagsChanged }
+                e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
                 e.post(tap: .cghidEventTap)
             }
         default:
@@ -777,6 +787,7 @@ final class CursorShare {
         }
         if let e = CGEvent(mouseEventSource: nil, mouseType: down ? downType : upType,
                            mouseCursorPosition: CGPoint(x: vx, y: vy), mouseButton: btn) {
+            e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
             e.post(tap: .cghidEventTap)
         }
     }
