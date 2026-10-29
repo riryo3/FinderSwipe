@@ -8,7 +8,7 @@ import IOKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-17"
+let buildTag = "Build 20261030-18"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2211,12 +2211,25 @@ final class DialogSnap {
     private var observedPID: pid_t = 0
     private var seenWindows = Set<String>()
     private var workspaceObserver: NSObjectProtocol?
+    private var pollTimer: Timer?
+    var onNote: ((String) -> Void)?
 
     func start() {
         workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
             self?.attachToFrontmost()
         }
+        // シートは生成通知が来ないので、最前面アプリを定期的に見回る
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
+        RunLoop.main.add(t, forMode: .common)
+        pollTimer = t
         attachToFrontmost()
+    }
+
+    private func poll() {
+        guard enabled else { return }
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        scan(appElement: AXUIElementCreateApplication(app.processIdentifier))
     }
 
     private func attachToFrontmost() {
@@ -2259,7 +2272,21 @@ final class DialogSnap {
         var ref: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &ref) == .success,
               let windows = ref as? [AXUIElement] else { return }
-        for w in windows { inspect(window: w) }
+        for w in windows {
+            inspect(window: w)
+            // シートはウィンドウの子(AXSheet)としてぶら下がるので、子も見る
+            var chRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(w, kAXChildrenAttribute as CFString, &chRef) == .success,
+               let children = chRef as? [AXUIElement] {
+                for c in children {
+                    var roleRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(c, kAXRoleAttribute as CFString, &roleRef) == .success,
+                       (roleRef as? String) == "AXSheet" {
+                        inspect(window: c)
+                    }
+                }
+            }
+        }
     }
 
     /// ウィンドウの識別子(同じダイアログへ二度運ばないため)
@@ -2280,12 +2307,10 @@ final class DialogSnap {
     func inspect(window: AXUIElement) {
         guard enabled, !CursorShare.shared.anySessionActive else { return }
         let key = windowKey(window)
-        if !key.isEmpty {
-            if seenWindows.contains(key) { return }
-            seenWindows.insert(key)
-            if seenWindows.count > 200 { seenWindows.removeAll() }
-        }
-        guard isDialogLike(window) else { return }
+        if seenWindows.contains(key) { return }
+        // ダイアログでないものは記録して二度見ない。ダイアログなのにボタンがまだ
+        // 用意できていない場合は記録せず、次の見回りでもう一度見る
+        guard isDialogLike(window) else { seenWindows.insert(key); return }
         var btnRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(window, "AXDefaultButton" as CFString, &btnRef) == .success,
               let btn = btnRef else { return }
@@ -2301,6 +2326,9 @@ final class DialogSnap {
         AXValueGetValue(sizeV as! AXValue, .cgSize, &size)
         guard size.width > 0, size.height > 0 else { return }
         CGWarpMouseCursorPosition(CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2))
+        seenWindows.insert(key)
+        if seenWindows.count > 200 { seenWindows.removeAll() }
+        onNote?("ダイアログの既定ボタンへ移動しました")
     }
 
     /// ダイアログ本体か、シート(親がウィンドウ)なら true
@@ -2727,6 +2755,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.lastItem.title = "最後の検出： \(label)"
         }
         ClipShare.shared.start()
+        DialogSnap.shared.onNote = { [weak self] label in
+            self?.flashIcon()
+            self?.lastItem.title = "最後の検出： \(label)"
+        }
         DialogSnap.shared.start()
         SwitchSync.shared.start()
         SearchSync.shared.start()
