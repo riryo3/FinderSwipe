@@ -502,13 +502,23 @@ final class CursorShare {
     func requestInputAccessNow() {
         let before = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
         let ok = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        // HID 層でキー入力の「聞くだけタップ」を作る試みも、設定リストへの登録の引き金になるので併用する
+        var probeOK = false
+        let keyMask = CGEventMask(1) << CGEventMask(CGEventType.keyDown.rawValue)
+        if let probe = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .listenOnly,
+                                         eventsOfInterest: keyMask,
+                                         callback: { _, _, e, _ in Unmanaged.passUnretained(e) }, userInfo: nil) {
+            probeOK = true
+            CGEvent.tapEnable(tap: probe, enable: false)
+            CFMachPortInvalidate(probe)
+        }
         let label: String
         switch before {
         case kIOHIDAccessTypeGranted: label = "許可済み"
         case kIOHIDAccessTypeDenied: label = "拒否済み（設定で変更が必要）"
         default: label = "未確認"
         }
-        status("入力監視： \(label) / リクエスト \(ok ? "OK" : "NG")")
+        status("入力監視： \(label) / リクエスト \(ok ? "OK" : "NG") / HIDタップ \(probeOK ? "作成可" : "作成不可")")
     }
 
     // MARK: イベントタップ(起点と、参加中の物理入力の扱い)
