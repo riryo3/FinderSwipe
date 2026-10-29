@@ -15,8 +15,10 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Drawing;
 using System.Text;
 using System.Threading;
+using System.Windows.Forms;
 
 internal static class Program
 {
@@ -27,7 +29,6 @@ internal static class Program
     private static string myId;
     private static string myName;
     private static readonly Dictionary<string, string> configKv = new Dictionary<string, string>();
-    private static DateTime holdingSince = DateTime.MinValue;
     private static readonly Dictionary<string, string> neighbor = new Dictionary<string, string>(); // "left" など → 相手のID
     private static readonly Dictionary<long, DateTime> seenActions = new Dictionary<long, DateTime>();
     private static readonly Dictionary<string, string> peers = new Dictionary<string, string>();
@@ -231,7 +232,7 @@ internal static class Program
         neighbor[dir] = id;
         configKv[dir] = id;
         SaveConfig();
-        Console.WriteLine("カーソル共有: 隣 (" + dir + ") に " + PeerName(id) + " を覚えました");
+        Log("カーソル共有: 隣 (" + dir + ") に " + PeerName(id) + " を覚えました");
     }
 
     private static string DirOf(string id)
@@ -267,14 +268,14 @@ internal static class Program
             SendFast("leave " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture));
             holding = false;
             cameFrom = null;
-            Console.WriteLine("カーソル共有: 手元に返しました");
+            Log("カーソル共有: 手元に返しました");
         }
         else
         {
             SendFast("enter " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + dir);
             forwardTo = next;
             holding = false;
-            Console.WriteLine("カーソル共有: " + PeerName(next) + " へ渡しました");
+            Log("カーソル共有: " + PeerName(next) + " へ渡しました");
         }
         return true;
     }
@@ -288,14 +289,10 @@ internal static class Program
             vx += dx; vy += dy;
             double ry = (vy - ScrY) / ScrH;
             double rx = (vx - ScrX) / ScrW;
-            // 保持し始めの300msは端を越えても出ない(入った直後の指の残りで出入りを繰り返すバタつき防止)
-            if ((DateTime.UtcNow - holdingSince).TotalMilliseconds >= 300)
-            {
-                if (vx >= ScrX + ScrW && Cross("right", ry)) return;
-                if (vx < ScrX && Cross("left", ry)) return;
-                if (vy >= ScrY + ScrH && Cross("down", rx)) return;
-                if (vy < ScrY && Cross("up", rx)) return;
-            }
+            if (vx >= ScrX + ScrW && Cross("right", ry)) return;
+            if (vx < ScrX && Cross("left", ry)) return;
+            if (vy >= ScrY + ScrH && Cross("down", rx)) return;
+            if (vy < ScrY && Cross("up", rx)) return;
             if (vx < ScrX) vx = ScrX;
             if (vx > ScrX + ScrW - 1) vx = ScrX + ScrW - 1;
             if (vy < ScrY) vy = ScrY;
@@ -352,7 +349,6 @@ internal static class Program
             double ratio;
             if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
             holding = true;
-            holdingSince = DateTime.UtcNow;
             cameFrom = from;
             string d = null;
             if (args.Length > 1)
@@ -363,7 +359,7 @@ internal static class Program
             }
             if (d == null) d = DirOf(from);
             if (d != null) PositionAtEdge(d, ratio);
-            Console.WriteLine("カーソル共有: " + PeerName(from) + " から受け取りました");
+            Log("カーソル共有: " + PeerName(from) + " から受け取りました");
         }
         else if (kind == "leave")
         {
@@ -373,10 +369,9 @@ internal static class Program
                 if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
                 forwardTo = null;
                 holding = true; // cameFrom は元の相手のまま
-                holdingSince = DateTime.UtcNow;
                 string d = DirOf(from);
                 if (d != null) PositionAtEdge(d, ratio);
-                Console.WriteLine("カーソル共有: 戻ってきました");
+                Log("カーソル共有: 戻ってきました");
             }
         }
         else
@@ -423,7 +418,7 @@ internal static class Program
             case "open": PressKey(VK_RETURN); break;
             default: return;
         }
-        Console.WriteLine("実行: " + action);
+        Log("実行: " + action);
     }
 
     private static void ReceiveSwipe(string action, long seq)
@@ -436,20 +431,103 @@ internal static class Program
         Foreground kind = ForegroundKind();
         if (kind == Foreground.None)
         {
-            Console.WriteLine("受信: " + action + " (対応アプリが最前面ではないので実行しません)");
+            Log("受信: " + action + " (対応アプリが最前面ではないので実行しません)");
             return;
         }
         if (kind == Foreground.Chromium && action != "back" && action != "forward")
         {
-            Console.WriteLine("受信: " + action + " (Chromium 系では履歴移動だけ対応)");
+            Log("受信: " + action + " (Chromium 系では履歴移動だけ対応)");
             return;
         }
-        Console.WriteLine("受信: " + action);
+        Log("受信: " + action);
         ActSwipe(action);
     }
 
     private static Mutex singleMutex;
 
+    // ---- ログ(常駐アプリなのでコンソールではなくメモリに貯め、必要なときだけ窓で見る) ----
+    private static readonly List<string> logLines = new List<string>();
+    private static TextBox logBox;
+    private static Form logForm;
+
+    private static void Log(string s)
+    {
+        string line = DateTime.Now.ToString("HH:mm:ss") + " " + s;
+        lock (logLines)
+        {
+            logLines.Add(line);
+            if (logLines.Count > 300) logLines.RemoveAt(0);
+        }
+        TextBox tb = logBox;
+        if (tb != null && !tb.IsDisposed)
+        {
+            try { tb.BeginInvoke((MethodInvoker)delegate { if (logBox != null) logBox.AppendText(line + "\r\n"); }); }
+            catch (Exception) { }
+        }
+    }
+
+    private static void ShowLogWindow()
+    {
+        if (logForm != null && !logForm.IsDisposed) { logForm.Activate(); return; }
+        logForm = new Form();
+        logForm.Text = "ワンマンカーソル - ログ (自分の ID: " + myId + ")";
+        logForm.Width = 680;
+        logForm.Height = 380;
+        TextBox tb = new TextBox();
+        tb.Multiline = true;
+        tb.ReadOnly = true;
+        tb.Dock = DockStyle.Fill;
+        tb.ScrollBars = ScrollBars.Vertical;
+        tb.Font = new Font("Consolas", 9);
+        lock (logLines) { tb.Text = string.Join("\r\n", logLines.ToArray()) + "\r\n"; }
+        logBox = tb;
+        logForm.Controls.Add(tb);
+        logForm.FormClosed += delegate { logBox = null; logForm = null; };
+        logForm.Show();
+    }
+
+    private static Icon MakeWaIcon()
+    {
+        Bitmap bmp = new Bitmap(32, 32);
+        using (Graphics g = Graphics.FromImage(bmp))
+        {
+            g.Clear(Color.FromArgb(64, 100, 220));
+            using (Font f = new Font("Meiryo UI", 17, FontStyle.Bold))
+            using (Brush b = new SolidBrush(Color.White))
+            {
+                g.DrawString("ワ", f, b, 1, 3);
+            }
+        }
+        return Icon.FromHandle(bmp.GetHicon());
+    }
+
+    private sealed class TrayContext : ApplicationContext
+    {
+        private readonly NotifyIcon icon;
+
+        public TrayContext()
+        {
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Items.Add("ログを表示", null, delegate { ShowLogWindow(); });
+            menu.Items.Add("自分の ID: " + myId, null, null).Enabled = false;
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("終了", null, delegate { Exit(); });
+            icon = new NotifyIcon();
+            icon.Text = "ワンマンカーソル (ID: " + myId + ")";
+            icon.Icon = MakeWaIcon();
+            icon.ContextMenuStrip = menu;
+            icon.Visible = true;
+            icon.DoubleClick += delegate { ShowLogWindow(); };
+        }
+
+        private void Exit()
+        {
+            icon.Visible = false;
+            Environment.Exit(0);
+        }
+    }
+
+    [STAThread]
     private static void Main()
     {
         // 二重起動の防止(複数動くと合図が重なって競合するため)
@@ -457,21 +535,23 @@ internal static class Program
         singleMutex = new Mutex(true, "OneManCursor.WindowsPeer", out createdNew);
         if (!createdNew)
         {
-            Console.WriteLine("すでに起動しています。二重には起動しません。");
-            Thread.Sleep(2000);
+            MessageBox.Show("すでに起動しています。二重には起動しません。", "ワンマンカーソル");
             return;
         }
         LoadConfig();
         sender = new UdpClient();
         sender.EnableBroadcast = true;
 
-        Console.WriteLine("ワンマンカーソル OneManCursor (Windows)");
-        Console.WriteLine("  名前: " + myName + " / 自分のID: " + myId);
-        Console.WriteLine("  画面: " + ScrW + "x" + ScrH + " (原点 " + ScrX + "," + ScrY + ")");
+        Log("ワンマンカーソル OneManCursor (Windows)");
+        Log("  名前: " + myName + " / 自分のID: " + myId);
+        Log("  画面: " + ScrW + "x" + ScrH + " (原点 " + ScrX + "," + ScrY + ")");
         foreach (KeyValuePair<string, string> p in neighbor)
-            Console.WriteLine("  隣 (" + p.Key + "): " + p.Value);
-        Console.WriteLine("  UDP " + Port + " で合図を待っています (Ctrl+C で終了)");
-        Console.WriteLine("  ※ Mac 側のレイアウト設定で、この ID を相手として置いてください");
+            Log("  隣 (" + p.Key + "): " + p.Value);
+        Log("  UDP " + Port + " で合図を待っています (終了はトレイのアイコンから)");
+        Log("  ※ Mac 側のレイアウト設定で、この ID を相手として置いてください");
+
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
 
         Thread helloThread = new Thread(() =>
         {
@@ -480,6 +560,15 @@ internal static class Program
         helloThread.IsBackground = true;
         helloThread.Start();
 
+        Thread netThread = new Thread(ReceiveLoop);
+        netThread.IsBackground = true;
+        netThread.Start();
+
+        Application.Run(new TrayContext());
+    }
+
+    private static void ReceiveLoop()
+    {
         UdpClient udp = new UdpClient(Port);
         IPEndPoint fromEp = new IPEndPoint(IPAddress.Any, 0);
         while (true)
@@ -500,14 +589,14 @@ internal static class Program
             if (kind == "hello")
             {
                 string name = string.Join(" ", rest);
-                if (!peers.ContainsKey(from)) Console.WriteLine("相方を発見: " + name + " (ID: " + from + ")");
+                if (!peers.ContainsKey(from)) Log("相方を発見: " + name + " (ID: " + from + ")");
                 peers[from] = name.Length > 0 ? name : "Mac";
                 continue;
             }
             if (kind == "reset")
             {
                 holding = false; cameFrom = null; forwardTo = null;
-                Console.WriteLine("カーソル共有: リセットされました");
+                Log("カーソル共有: リセットされました");
                 continue;
             }
             if (kind == "back" || kind == "forward" || kind == "parent" || kind == "open")

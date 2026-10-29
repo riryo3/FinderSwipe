@@ -932,7 +932,6 @@ final class CursorShare {
             guard awayTo == nil, !holding, forwardTo == nil, rest.count >= 1 else { return }
             sending = false
             holding = true
-            holdingSince = Date()
             cameFrom = from
             let ratio = Double(rest[0]) ?? 0.5
             if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio) }
@@ -952,7 +951,6 @@ final class CursorShare {
                 // 中継していた先から戻ってきた → 自分が保持者になる(cameFrom は元の相手のまま)
                 forwardTo = nil
                 holding = true
-                holdingSince = Date()
                 if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio); warp() }
                 status("カーソル共有： 戻ってきました")
             }
@@ -978,9 +976,6 @@ final class CursorShare {
         case .up: vy = Double(b.minY); vx = Double(b.minX) + ratio * Double(b.width)
         }
     }
-
-    /// 保持し始めの時刻。直後300msは端を越えても出ない(端での出入りのバタつき防止)
-    private var holdingSince = Date(timeIntervalSince1970: 0)
 
     /// 端を越えたときの受け渡し・返却。実行したら true
     private func cross(_ dir: PartnerDir, ratio: Double) -> Bool {
@@ -1008,12 +1003,10 @@ final class CursorShare {
             vy += dy
             let ry = (vy - Double(b.minY)) / Double(b.height)
             let rx = (vx - Double(b.minX)) / Double(b.width)
-            if Date().timeIntervalSince(holdingSince) >= 0.3 {
-                if vx >= Double(b.maxX), cross(.right, ratio: ry) { return }
-                if vx < Double(b.minX), cross(.left, ratio: ry) { return }
-                if vy >= Double(b.maxY), cross(.down, ratio: rx) { return }
-                if vy < Double(b.minY), cross(.up, ratio: rx) { return }
-            }
+            if vx >= Double(b.maxX), cross(.right, ratio: ry) { return }
+            if vx < Double(b.minX), cross(.left, ratio: ry) { return }
+            if vy >= Double(b.maxY), cross(.down, ratio: rx) { return }
+            if vy < Double(b.minY), cross(.up, ratio: rx) { return }
             vx = min(max(vx, Double(b.minX)), Double(b.maxX) - 1)
             vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
             postMoveThrottled()
