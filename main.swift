@@ -220,8 +220,45 @@ enum LinkNet {
     private static var pendingDy = 0
     private static var flushScheduled = false
 
-    /// 発見した相方(id → 名前と最終確認時刻)
-    private(set) static var peers: [String: (name: String, seen: Date)] = [:]
+    /// 発見した相方(id → 名前・IP・最終確認時刻)
+    private(set) static var peers: [String: (name: String, ip: String, seen: Date)] = [:]
+
+    // TCP 直結(到達と順序が保証されるので、キーの欠け対策の本命)
+    static let tcpPort: UInt16 = 45988
+    private static var conns: [String: TcpConn] = [:]
+    private static let connsLock = NSLock()
+
+    final class TcpConn {
+        let fd: Int32
+        private let writeLock = NSLock()
+        init(fd: Int32) { self.fd = fd }
+        func sendLine(_ line: String) -> Bool {
+            writeLock.lock()
+            defer { writeLock.unlock() }
+            let bytes = Array((line + "\n").utf8)
+            var sent = 0
+            while sent < bytes.count {
+                let n = bytes.withUnsafeBytes { buf in
+                    send(fd, buf.baseAddress!.advanced(by: sent), bytes.count - sent, 0)
+                }
+                if n <= 0 { return false }
+                sent += n
+            }
+            return true
+        }
+        func close() {
+            shutdown(fd, SHUT_RDWR)
+            Darwin.close(fd)
+        }
+    }
+
+    /// 接続済みの全相方へ TCP で送る(つながっていない相手は UDP 側で拾う)
+    private static func sendToAllPeers(_ text: String) {
+        connsLock.lock()
+        let list = Array(conns.values)
+        connsLock.unlock()
+        for c in list { _ = c.sendLine(text) }
+    }
 
     /// 名乗りを送り始める(レイアウト設定で相方を見つけるため)
     static func startHello() {
@@ -236,7 +273,9 @@ enum LinkNet {
 
     /// カーソル共有セッションの全体リセット
     static func sendReset() {
-        udpSend(magic + "\(machineID) 0 reset")
+        let text = magic + "\(machineID) 0 reset"
+        sendToAllPeers(text)
+        udpSend(text)
     }
 
     /// 自分の識別子(自分の送った合図を自分で受けないため)
@@ -269,11 +308,12 @@ enum LinkNet {
         }
     }
 
-    /// スワイプの合図(確実に届けたいので同じものを3回送る)
+    /// スワイプの合図(TCP で全相方へ送り、つながっていない相手向けに UDP でも3回送る)
     static func send(_ wire: String) {
         let seq = UInt64(Date().timeIntervalSince1970 * 1000)
         let text = magic + "\(machineID) \(seq) \(wire)"
         DispatchQueue.global().async {
+            sendToAllPeers(text)
             for _ in 0..<3 {
                 udpSend(text)
                 Thread.sleep(forTimeInterval: 0.03)
@@ -303,13 +343,9 @@ enum LinkNet {
                 }
             }
             flushMove()
-            // キーやクリックなどの「出来事」は落とすと致命的なので、同じ連番で3回送る(受け側で重複を捨てる)
-            fastSeq &+= 1
-            let text = magic + "\(machineID) \(fastSeq) \(body)"
-            udpSend(text)
-            for delay in [0.010, 0.020] {
-                sendQueue.asyncAfter(deadline: .now() + delay) { udpSend(text) }
-            }
+            // キーやクリックなどの「出来事」は落とすと致命的。TCP があれば1回で確実に届き、
+            // 無ければ UDP で同じ連番を3回送る(受け側で重複を捨てる)
+            rawSend(body, copies: 3)
         }
     }
 
@@ -323,9 +359,32 @@ enum LinkNet {
         }
     }
 
-    private static func rawSend(_ body: String) {
+    private static func rawSend(_ body: String, copies: Int = 1) {
         fastSeq &+= 1
-        udpSend(magic + "\(machineID) \(fastSeq) \(body)")
+        let text = magic + "\(machineID) \(fastSeq) \(body)"
+        if emitViaTCP(text, body: body) { return }
+        udpSend(text)
+        if copies > 1 {
+            for delay in [0.010, 0.020] {
+                sendQueue.asyncAfter(deadline: .now() + delay) { udpSend(text) }
+            }
+        }
+    }
+
+    /// 宛先の相手と TCP でつながっていれば、そちらで送る。送れたら true
+    private static func emitViaTCP(_ text: String, body: String) -> Bool {
+        let parts = body.split(separator: " ")
+        guard parts.count >= 2 else { return false }
+        let target = String(parts[1])
+        connsLock.lock()
+        let conn = conns[target]
+        connsLock.unlock()
+        guard let conn = conn else { return false }
+        if conn.sendLine(text) { return true }
+        connsLock.lock()
+        if conns[target] === conn { conns[target] = nil }
+        connsLock.unlock()
+        return false
     }
 
     static func startReceiver() {
@@ -344,42 +403,167 @@ enum LinkNet {
                 }
             }
             guard bound == 0 else { return }
-            var buf = [UInt8](repeating: 0, count: 256)
+            var buf = [UInt8](repeating: 0, count: 2048)
             while true {
-                let n = recv(fd, &buf, buf.count, 0)
+                var src = sockaddr_in()
+                var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let n = withUnsafeMutablePointer(to: &src) { p in
+                    p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        recvfrom(fd, &buf, buf.count, 0, sa, &srcLen)
+                    }
+                }
                 guard n > 0 else { continue }
                 let s = String(decoding: buf[0..<n], as: UTF8.self)
-                guard s.hasPrefix(magic) else { continue }
-                let parts = s.dropFirst(magic.count).split(separator: " ")
-                guard parts.count >= 3, String(parts[0]) != machineID, let seq = UInt64(parts[1]) else { continue }
-                let kind = String(parts[2])
-                if kind == "hello" {
-                    let name = parts.dropFirst(3).joined(separator: " ")
-                    peers[String(parts[0])] = (name.isEmpty ? "Mac" : name, Date())
-                    continue
-                }
-                if kind == "reset" {
-                    CursorShare.shared.resetSession()
-                    continue
-                }
-                if SwipeAction.fromWire(kind) != nil {
-                    // スワイプの合図: 3回送られてくる同じものは1回だけ実行する
-                    let now = Date().timeIntervalSince1970
-                    if let seen = seenSeqs[seq], now - seen < 2 { continue }
-                    seenSeqs[seq] = now
-                    seenSeqs = seenSeqs.filter { now - $0.value < 10 }
-                    Engine.shared.receiveLink(kind)
-                } else {
-                    // カーソル共有の合図: 重要イベントは3回送られてくるので、同じ連番は1回だけ処理する
-                    let dupKey = "\(parts[0])-\(seq)"
-                    let nowFast = Date().timeIntervalSince1970
-                    if let seen = seenFast[dupKey], nowFast - seen < 2 { continue }
-                    seenFast[dupKey] = nowFast
-                    seenFast = seenFast.filter { nowFast - $0.value < 10 }
-                    CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) }, from: String(parts[0]))
-                }
+                let ip = String(cString: inet_ntoa(src.sin_addr))
+                handlePacket(s, ip: ip)
             }
         }
+    }
+
+    /// 合図1つ分の処理(UDP でも TCP でも共通)
+    static func handlePacket(_ s: String, ip: String) {
+        guard s.hasPrefix(magic) else { return }
+        let parts = s.dropFirst(magic.count).split(separator: " ")
+        guard parts.count >= 3, String(parts[0]) != machineID, let seq = UInt64(parts[1]) else { return }
+        let kind = String(parts[2])
+        if kind == "hello" {
+            let name = parts.dropFirst(3).joined(separator: " ")
+            peers[String(parts[0])] = (name.isEmpty ? "Mac" : name, ip, Date())
+            return
+        }
+        if kind == "reset" {
+            CursorShare.shared.resetSession()
+            return
+        }
+        if SwipeAction.fromWire(kind) != nil {
+            // スワイプの合図: 複数回・複数経路で届く同じものは1回だけ実行する
+            let now = Date().timeIntervalSince1970
+            if let seen = seenSeqs[seq], now - seen < 2 { return }
+            seenSeqs[seq] = now
+            seenSeqs = seenSeqs.filter { now - $0.value < 10 }
+            Engine.shared.receiveLink(kind)
+        } else {
+            // カーソル共有の合図: UDP では3回送られてくるので、同じ連番は1回だけ処理する
+            let dupKey = "\(parts[0])-\(seq)"
+            let nowFast = Date().timeIntervalSince1970
+            if let seen = seenFast[dupKey], nowFast - seen < 2 { return }
+            seenFast[dupKey] = nowFast
+            seenFast = seenFast.filter { nowFast - $0.value < 10 }
+            CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) }, from: String(parts[0]))
+        }
+    }
+
+    // MARK: TCP 直結
+
+    static func startTCP() {
+        // 受け付け側
+        DispatchQueue.global().async {
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            guard fd >= 0 else { return }
+            var yes: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = tcpPort.bigEndian
+            addr.sin_addr.s_addr = INADDR_ANY
+            let bound = withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bound == 0, listen(fd, 8) == 0 else { return }
+            while true {
+                let c = accept(fd, nil, nil)
+                if c < 0 { continue }
+                configureConn(c)
+                DispatchQueue.global().async { serveConn(c, expectedPeer: nil, conn: nil) }
+            }
+        }
+        // つなぎに行く側: 重複を避けるため、ID が小さい方が相手に接続する
+        DispatchQueue.global().async {
+            while true {
+                let now = Date()
+                for (id, info) in peers where machineID < id && now.timeIntervalSince(info.seen) < 20 {
+                    connsLock.lock()
+                    let has = conns[id] != nil
+                    connsLock.unlock()
+                    if !has { connectToPeer(id: id, ip: info.ip) }
+                }
+                Thread.sleep(forTimeInterval: 3)
+            }
+        }
+    }
+
+    private static func configureConn(_ fd: Int32) {
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+    }
+
+    private static func connectToPeer(id: String, ip: String) {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = tcpPort.bigEndian
+        addr.sin_addr.s_addr = inet_addr(ip)
+        let r = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard r == 0 else { close(fd); return }
+        configureConn(fd)
+        let conn = TcpConn(fd: fd)
+        registerConn(conn, for: id)
+        let name = Host.current().localizedName ?? "Mac"
+        _ = conn.sendLine("FSHELLO \(machineID) \(name)")
+        DispatchQueue.global().async { serveConn(fd, expectedPeer: id, conn: conn) }
+    }
+
+    private static func registerConn(_ conn: TcpConn, for id: String) {
+        connsLock.lock()
+        let old = conns[id]
+        conns[id] = conn
+        connsLock.unlock()
+        old?.close()
+    }
+
+    /// 1接続の読み取り。先頭の FSHELLO で相手を確認し、以降は合図を1行ずつ処理する
+    private static func serveConn(_ fd: Int32, expectedPeer: String?, conn knownConn: TcpConn?) {
+        var buffer = ""
+        var peerID = expectedPeer
+        var conn = knownConn
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = recv(fd, &chunk, chunk.count, 0)
+            if n <= 0 { break }
+            buffer += String(decoding: chunk[0..<n], as: UTF8.self)
+            if buffer.count > 65536 { buffer.removeAll() }
+            while let range = buffer.range(of: "\n") {
+                let line = String(buffer[buffer.startIndex..<range.lowerBound])
+                buffer = String(buffer[range.upperBound...])
+                if line.hasPrefix("FSHELLO ") {
+                    let t = line.dropFirst(8).split(separator: " ", maxSplits: 1)
+                    if let first = t.first {
+                        peerID = String(first)
+                        if conn == nil {
+                            let c = TcpConn(fd: fd)
+                            conn = c
+                            registerConn(c, for: peerID!)
+                        }
+                    }
+                    continue
+                }
+                if peerID != nil { handlePacket(line, ip: "") }
+            }
+        }
+        if let id = peerID, let c = conn {
+            connsLock.lock()
+            if conns[id] === c { conns[id] = nil }
+            connsLock.unlock()
+        }
+        close(fd)
     }
 }
 
@@ -952,6 +1136,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         LinkNet.startReceiver()
         LinkNet.startHello()
+        LinkNet.startTCP()
 
         let devices = Multitouch.start()
         mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： 接続失敗"
