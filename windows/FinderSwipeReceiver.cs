@@ -1,8 +1,9 @@
 // FinderSwipeReceiver (試作)
 // Mac 側の FinderSwipe から届く「合図」(UDP ブロードキャスト)を受けて、
-// エクスプローラーのショートカットに変換して送る Windows 用の受け専用プログラム。
-//   戻る = Alt+← / 進む = Alt+→ / 上の階層 = Alt+↑ / 開く = Enter
-// エクスプローラーが最前面のときだけ実行する。合図の形式は Mac 版と共通。
+// アプリごとのショートカットに変換して送る Windows 用の受け専用プログラム。
+//   エクスプローラー: 戻る = Alt+← / 進む = Alt+→ / 上の階層 = Alt+↑ / 開く = Enter
+//   Chrome などの Chromium 系: 戻る = Alt+← / 進む = Alt+→ (履歴移動。それ以外は対象外)
+// 対応アプリが最前面のときだけ実行する。合図の形式は Mac 版と共通。
 
 using System;
 using System.Collections.Generic;
@@ -84,12 +85,17 @@ internal static class Program
         SendKeys(MakeKey(vk, false), MakeKey(vk, true));
     }
 
-    private static bool ExplorerIsForeground()
+    private enum Foreground { None, Explorer, Chromium }
+
+    private static Foreground ForegroundKind()
     {
         StringBuilder sb = new StringBuilder(256);
         GetClassName(GetForegroundWindow(), sb, sb.Capacity);
         string cls = sb.ToString();
-        return cls == "CabinetWClass" || cls == "ExploreWClass";
+        if (cls == "CabinetWClass" || cls == "ExploreWClass") return Foreground.Explorer;
+        // Chrome / Edge など Chromium 系は全部このクラス名になる
+        if (cls == "Chrome_WidgetWin_1") return Foreground.Chromium;
+        return Foreground.None;
     }
 
     private static void Act(string action)
@@ -126,9 +132,15 @@ internal static class Program
             if (Seen.TryGetValue(seq, out seenAt) && (now - seenAt).TotalSeconds < 2) continue;
             Seen[seq] = now;
 
-            if (!ExplorerIsForeground())
+            Foreground kind = ForegroundKind();
+            if (kind == Foreground.None)
             {
-                Console.WriteLine("受信: " + parts[1] + " (エクスプローラーが最前面ではないので実行しません)");
+                Console.WriteLine("受信: " + parts[1] + " (対応アプリが最前面ではないので実行しません)");
+                continue;
+            }
+            if (kind == Foreground.Chromium && parts[1] != "back" && parts[1] != "forward")
+            {
+                Console.WriteLine("受信: " + parts[1] + " (Chromium 系では履歴移動だけ対応)");
                 continue;
             }
             Console.WriteLine("受信: " + parts[1]);
