@@ -998,9 +998,10 @@ final class CursorShare {
             if vy < Double(b.minY), cross(.up, ratio: rx) { return }
             vx = min(max(vx, Double(b.minX)), Double(b.maxX) - 1)
             vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
-            warpThrottled()
+            postMoveThrottled()
         case "dn", "up":
             guard let n = args.first.flatMap({ Int($0) }) else { return }
+            if kind == "dn" { downButtons.insert(n) } else { downButtons.remove(n) }
             postMouse(down: kind == "dn", button: n)
         case "sc":
             guard args.count == 2, let dy = Int32(args[0]), let dx = Int32(args[1]) else { return }
@@ -1025,6 +1026,44 @@ final class CursorShare {
     private func warp() {
         CGWarpMouseCursorPosition(CGPoint(x: vx, y: vy))
         CGAssociateMouseAndMouseCursorPosition(1)
+    }
+
+    private var downButtons = Set<Int>()
+
+    /// 受け側の移動は「本物のマウス移動イベント」として流す。
+    /// ワープだけだと Dock の自動表示やホバーなど、移動イベントを見る仕組みが反応しないため
+    private func postMove() {
+        let type: CGEventType
+        if downButtons.contains(1) { type = .rightMouseDragged }
+        else if downButtons.contains(2) { type = .otherMouseDragged }
+        else if downButtons.contains(0) { type = .leftMouseDragged }
+        else { type = .mouseMoved }
+        if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: CGPoint(x: vx, y: vy), mouseButton: .left) {
+            e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
+            e.post(tap: .cghidEventTap)
+        }
+    }
+
+    private var lastMovePost = Date.distantPast
+    private var movePostScheduled = false
+
+    private func postMoveThrottled() {
+        if Date().timeIntervalSince(lastMovePost) >= 0.008 {
+            lastMovePost = Date()
+            postMove()
+            return
+        }
+        if !movePostScheduled {
+            movePostScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.008) { [weak self] in
+                guard let self = self else { return }
+                self.movePostScheduled = false
+                if self.holding {
+                    self.lastMovePost = Date()
+                    self.postMove()
+                }
+            }
+        }
     }
 
     private var lastWarp = Date.distantPast
