@@ -53,6 +53,7 @@ enum SwipeAction: String {
 final class Engine {
     static let shared = Engine()
     var enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
+    var remoteMode = UserDefaults.standard.bool(forKey: "remoteMode")
     var onAction: ((String) -> Void)?
     var onStats: ((Int, Int) -> Void)?
 
@@ -117,18 +118,23 @@ final class Engine {
 
     private func fire(_ action: SwipeAction) {
         fired = true
+        // 送ってよい場面: Finder が最前面のとき。
+        // リモート操作モードでは Moonlight が最前面のときも送る(キーは Moonlight 経由で相手側に届く)
+        let front = NSWorkspace.shared.frontmostApplication
+        let isFinder = front?.bundleIdentifier == "com.apple.finder"
+        let isRemote = remoteMode && front?.localizedName == "Moonlight"
         var note = ""
         if !enabled {
             note = "（無効中）"
-        } else if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.apple.finder" {
-            note = "（Finder以外のため送信なし）"
-        } else {
+        } else if isFinder || isRemote {
             switch action {
             case .back: sendKey(33)      // [
             case .forward: sendKey(30)   // ]
             case .parent: sendKey(126)   // ↑
             case .open: sendKey(31)      // O
             }
+        } else {
+            note = "（対象のアプリ以外のため送信なし）"
         }
         let label = action.rawValue + note
         DispatchQueue.main.async { [weak self] in self?.onAction?(label) }
@@ -194,6 +200,7 @@ func fingerIcon() -> NSImage {
 final class App: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     var enabledItem: NSMenuItem!
+    var remoteItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
     var statsItem: NSMenuItem!
@@ -204,6 +211,8 @@ final class App: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         enabledItem = NSMenuItem(title: "有効", action: #selector(toggleEnabled), keyEquivalent: "")
         enabledItem.target = self
+        remoteItem = NSMenuItem(title: "リモート操作モード（Moonlight 使用時も有効）", action: #selector(toggleRemote), keyEquivalent: "")
+        remoteItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
         lastItem.isEnabled = false
         mtItem = NSMenuItem(title: "トラックパッド： —", action: nil, keyEquivalent: "")
@@ -212,7 +221,7 @@ final class App: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -241,11 +250,20 @@ final class App: NSObject, NSApplicationDelegate {
         }
     }
 
-    func refreshMenu() { enabledItem.state = Engine.shared.enabled ? .on : .off }
+    func refreshMenu() {
+        enabledItem.state = Engine.shared.enabled ? .on : .off
+        remoteItem.state = Engine.shared.remoteMode ? .on : .off
+    }
 
     @objc func toggleEnabled() {
         Engine.shared.enabled.toggle()
         UserDefaults.standard.set(Engine.shared.enabled, forKey: "enabled")
+        refreshMenu()
+    }
+
+    @objc func toggleRemote() {
+        Engine.shared.remoteMode.toggle()
+        UserDefaults.standard.set(Engine.shared.remoteMode, forKey: "remoteMode")
         refreshMenu()
     }
 
