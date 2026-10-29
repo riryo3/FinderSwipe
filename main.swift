@@ -1300,7 +1300,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         me.isEnabled = false
         menu.addItem(me)
         menu.addItem(.separator())
-        let peers = LinkNet.peers.sorted { $0.value.name < $1.value.name }
+        // 最近(30秒以内)に合図があった相手だけを出す。古い記録が残ると同じ相手が二つに見えるため
+        let peers = LinkNet.peers.filter { Date().timeIntervalSince($0.value.seen) < 30 }.sorted { $0.value.name < $1.value.name }
         if peers.isEmpty {
             let none = NSMenuItem(title: "相方が見つかっていません（相手でもアプリを起動してください）", action: nil, keyEquivalent: "")
             none.isEnabled = false
@@ -1308,7 +1309,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         for (id, info) in peers {
-            let parent = NSMenuItem(title: info.name, action: nil, keyEquivalent: "")
+            let parent = NSMenuItem(title: "\(info.name)（ID: \(id)）", action: nil, keyEquivalent: "")
             let sub = NSMenu()
             for (label, raw) in [("右に置く", "right"), ("左に置く", "left"), ("上に置く", "up"), ("下に置く", "down"), ("外す", "none")] {
                 let it = NSMenuItem(title: label, action: #selector(setNeighborFromMenu(_:)), keyEquivalent: "")
