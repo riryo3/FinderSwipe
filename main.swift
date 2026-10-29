@@ -498,6 +498,19 @@ final class CursorShare {
         }
     }
 
+    /// メニューから明示的に許可を求める版。macOS が見ている状態を「最後の検出」に出して切り分ける
+    func requestInputAccessNow() {
+        let before = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+        let ok = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        let label: String
+        switch before {
+        case kIOHIDAccessTypeGranted: label = "許可済み"
+        case kIOHIDAccessTypeDenied: label = "拒否済み（設定で変更が必要）"
+        default: label = "未確認"
+        }
+        status("入力監視： \(label) / リクエスト \(ok ? "OK" : "NG")")
+    }
+
     // MARK: イベントタップ(起点と、参加中の物理入力の扱い)
 
     func installTap() {
@@ -883,8 +896,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
+        let inputReqItem = NSMenuItem(title: "入力監視の許可を求める", action: #selector(requestInputAccess), keyEquivalent: "")
+        inputReqItem.target = self
         menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(layoutParent); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
-        menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
+        menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(inputReqItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         refreshMenu()
@@ -1031,6 +1046,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    @objc func requestInputAccess() {
+        CursorShare.shared.requestInputAccessNow()
     }
 
     func alert(_ title: String, _ text: String) {
