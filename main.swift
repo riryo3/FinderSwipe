@@ -461,6 +461,32 @@ final class CursorShare {
         holding = false
         cameFrom = nil
         forwardTo = nil
+        showCursor()
+    }
+
+    private var cursorHidden = false
+
+    /// 操作を渡している間、起点側のカーソルは隠す(見えていると誤タップの元になるため)。
+    /// クリック自体はタップで飲んでいるのでアプリには届かないが、見た目も消しておく
+    private func hideCursor() {
+        guard !cursorHidden else { return }
+        cursorHidden = true
+        for id in activeDisplayIDs() { CGDisplayHideCursor(id) }
+    }
+
+    private func showCursor() {
+        guard cursorHidden else { return }
+        cursorHidden = false
+        for id in activeDisplayIDs() { CGDisplayShowCursor(id) }
+    }
+
+    private func activeDisplayIDs() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        guard count > 0 else { return [CGMainDisplayID()] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetActiveDisplayList(count, &ids, &count)
+        return ids
     }
 
     /// 入力監視への「登録」だけ自動で行う。
@@ -571,6 +597,7 @@ final class CursorShare {
             sending = true
             awayTo = next
             for _ in 0..<3 { LinkNet.sendFast("enter \(next) \(ratio)") }
+            hideCursor()
             status("カーソル共有： \(peerName(next)) に渡しました")
             return true
         }
@@ -626,6 +653,7 @@ final class CursorShare {
             if awayTo == from {
                 // 起点にカーソルが戻ってきた(セッション自体は継続)
                 awayTo = nil
+                showCursor()
                 if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio); warp() }
                 status("カーソル共有： 手元に戻りました")
             } else if forwardTo == from {
