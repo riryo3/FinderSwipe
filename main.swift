@@ -8,7 +8,7 @@ import IOKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-20"
+let buildTag = "Build 20261030-21"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2369,6 +2369,7 @@ final class SwitchSync {
     private var observer: NSObjectProtocol?
     private var mcTimer: Timer?
     private var mcActive = false
+    var onNote: ((String) -> Void)?
 
     func start() {
         guard observer == nil else { return }
@@ -2391,6 +2392,7 @@ final class SwitchSync {
         guard enabled, !switching else { return }
         setFlag(true)
         broadcast("open")
+        onNote?("Mission Control を検知: 合図を送りました")
     }
 
     /// 自分が Esc で一覧を閉じた: 確定と同じ扱いで、他端末の一覧も閉じさせる
@@ -2403,6 +2405,7 @@ final class SwitchSync {
     func openLocal() {
         guard enabled else { return }
         setFlag(true)
+        onNote?("合図を受けて Mission Control を開きます")
         postKey(126, flags: .maskControl)
     }
 
@@ -2417,6 +2420,7 @@ final class SwitchSync {
         guard switching else { return }
         setFlag(false)
         broadcast("done")
+        onNote?("確定を送りました")
     }
 
     /// Mission Control / Exposé の開閉を検知する(ジェスチャやホットコーナーでも開くので、キーではなく画面を見る)
@@ -2767,6 +2771,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.lastItem.title = "最後の検出： \(label)"
         }
         DialogSnap.shared.start()
+        SwitchSync.shared.onNote = { [weak self] label in
+            self?.flashIcon()
+            self?.lastItem.title = "最後の検出： \(label)"
+        }
         SwitchSync.shared.start()
         SearchSync.shared.start()
 
