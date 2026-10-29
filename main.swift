@@ -55,6 +55,7 @@ final class Engine {
     var enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
     var remoteMode = UserDefaults.standard.bool(forKey: "remoteMode")
     var ucMode = UserDefaults.standard.bool(forKey: "ucMode")
+    var keyTapSession = UserDefaults.standard.bool(forKey: "keyTapSession")
     var onAction: ((String) -> Void)?
     var onStats: ((Int, Int) -> Void)?
 
@@ -145,10 +146,12 @@ final class Engine {
 
     private func sendKey(_ keyCode: CGKeyCode) {
         let src = CGEventSource(stateID: .combinedSessionState)
+        // ユニバーサルコントロールが拾う経路を探るため、送信方式を切り替えられるようにしている
+        let tap: CGEventTapLocation = keyTapSession ? .cgSessionEventTap : .cghidEventTap
         for down in [true, false] {
             if let e = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) {
                 e.flags = .maskCommand
-                e.post(tap: .cghidEventTap)
+                e.post(tap: tap)
             }
         }
     }
@@ -205,6 +208,7 @@ final class App: NSObject, NSApplicationDelegate {
     var enabledItem: NSMenuItem!
     var remoteItem: NSMenuItem!
     var ucItem: NSMenuItem!
+    var tapItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
     var statsItem: NSMenuItem!
@@ -219,6 +223,8 @@ final class App: NSObject, NSApplicationDelegate {
         remoteItem.target = self
         ucItem = NSMenuItem(title: "ユニバーサルコントロール用（最前面を問わず送る）", action: #selector(toggleUC), keyEquivalent: "")
         ucItem.target = self
+        tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
+        tapItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
         lastItem.isEnabled = false
         mtItem = NSMenuItem(title: "トラックパッド： —", action: nil, keyEquivalent: "")
@@ -227,7 +233,7 @@ final class App: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(ucItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(ucItem); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -260,6 +266,7 @@ final class App: NSObject, NSApplicationDelegate {
         enabledItem.state = Engine.shared.enabled ? .on : .off
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
         ucItem.state = Engine.shared.ucMode ? .on : .off
+        tapItem.state = Engine.shared.keyTapSession ? .on : .off
     }
 
     @objc func toggleEnabled() {
@@ -277,6 +284,12 @@ final class App: NSObject, NSApplicationDelegate {
     @objc func toggleUC() {
         Engine.shared.ucMode.toggle()
         UserDefaults.standard.set(Engine.shared.ucMode, forKey: "ucMode")
+        refreshMenu()
+    }
+
+    @objc func toggleTap() {
+        Engine.shared.keyTapSession.toggle()
+        UserDefaults.standard.set(Engine.shared.keyTapSession, forKey: "keyTapSession")
         refreshMenu()
     }
 
