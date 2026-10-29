@@ -54,6 +54,7 @@ final class Engine {
     static let shared = Engine()
     var enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
     var remoteMode = UserDefaults.standard.bool(forKey: "remoteMode")
+    var ucMode = UserDefaults.standard.bool(forKey: "ucMode")
     var onAction: ((String) -> Void)?
     var onStats: ((Int, Int) -> Void)?
 
@@ -123,10 +124,12 @@ final class Engine {
         let front = NSWorkspace.shared.frontmostApplication
         let isFinder = front?.bundleIdentifier == "com.apple.finder"
         let isRemote = remoteMode && front?.localizedName == "Moonlight"
+        // ユニバーサルコントロール用モードでは最前面を問わない
+        // (カーソルが相手側の画面にあるとき、キーはそちらに届く。手元側の Finder でも同じ意味になる)
         var note = ""
         if !enabled {
             note = "（無効中）"
-        } else if isFinder || isRemote {
+        } else if isFinder || isRemote || ucMode {
             switch action {
             case .back: sendKey(33)      // [
             case .forward: sendKey(30)   // ]
@@ -201,6 +204,7 @@ final class App: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     var enabledItem: NSMenuItem!
     var remoteItem: NSMenuItem!
+    var ucItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
     var statsItem: NSMenuItem!
@@ -213,6 +217,8 @@ final class App: NSObject, NSApplicationDelegate {
         enabledItem.target = self
         remoteItem = NSMenuItem(title: "リモート操作モード（Moonlight 使用時も有効）", action: #selector(toggleRemote), keyEquivalent: "")
         remoteItem.target = self
+        ucItem = NSMenuItem(title: "ユニバーサルコントロール用（最前面を問わず送る）", action: #selector(toggleUC), keyEquivalent: "")
+        ucItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
         lastItem.isEnabled = false
         mtItem = NSMenuItem(title: "トラックパッド： —", action: nil, keyEquivalent: "")
@@ -221,7 +227,7 @@ final class App: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(ucItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -253,6 +259,7 @@ final class App: NSObject, NSApplicationDelegate {
     func refreshMenu() {
         enabledItem.state = Engine.shared.enabled ? .on : .off
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
+        ucItem.state = Engine.shared.ucMode ? .on : .off
     }
 
     @objc func toggleEnabled() {
@@ -264,6 +271,12 @@ final class App: NSObject, NSApplicationDelegate {
     @objc func toggleRemote() {
         Engine.shared.remoteMode.toggle()
         UserDefaults.standard.set(Engine.shared.remoteMode, forKey: "remoteMode")
+        refreshMenu()
+    }
+
+    @objc func toggleUC() {
+        Engine.shared.ucMode.toggle()
+        UserDefaults.standard.set(Engine.shared.ucMode, forKey: "ucMode")
         refreshMenu()
     }
 
