@@ -32,6 +32,7 @@ struct Finger {
 typealias MTContactCallback = @convention(c) (Int32, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Void
 
 func mtCallback(_ device: Int32, _ fingers: UnsafeMutableRawPointer?, _ count: Int32, _ timestamp: Double, _ frame: Int32) {
+    Engine.shared.noteFrame(rawCount: Int(count), timestamp: timestamp)
     guard let fingers = fingers, count > 0 else {
         Engine.shared.handle([], timestamp: timestamp)
         return
@@ -53,6 +54,22 @@ final class Engine {
     static let shared = Engine()
     var enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
     var onAction: ((String) -> Void)?
+    var onStats: ((Int, Int) -> Void)?
+
+    // 診断用: コールバックが来ているか、指の数が読めているか
+    private(set) var frames = 0
+    private(set) var maxFingers = 0
+    private var lastStatsPush: Double = 0
+
+    func noteFrame(rawCount: Int, timestamp: Double) {
+        frames += 1
+        if rawCount > maxFingers { maxFingers = rawCount }
+        if timestamp - lastStatsPush > 0.25 {
+            lastStatsPush = timestamp
+            let f = frames, m = maxFingers
+            DispatchQueue.main.async { [weak self] in self?.onStats?(f, m) }
+        }
+    }
 
     private var session = false
     private var lockedCount = 0       // セッション中に確認した最大の指の数(2 か 3)
@@ -100,15 +117,20 @@ final class Engine {
 
     private func fire(_ action: SwipeAction) {
         fired = true
-        guard enabled else { return }
-        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder" else { return }
-        switch action {
-        case .back: sendKey(33)      // [
-        case .forward: sendKey(30)   // ]
-        case .parent: sendKey(126)   // ↑
-        case .open: sendKey(31)      // O
+        var note = ""
+        if !enabled {
+            note = "（無効中）"
+        } else if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.apple.finder" {
+            note = "（Finder以外のため送信なし）"
+        } else {
+            switch action {
+            case .back: sendKey(33)      // [
+            case .forward: sendKey(30)   // ]
+            case .parent: sendKey(126)   // ↑
+            case .open: sendKey(31)      // O
+            }
         }
-        let label = action.rawValue
+        let label = action.rawValue + note
         DispatchQueue.main.async { [weak self] in self?.onAction?(label) }
     }
 
@@ -131,24 +153,25 @@ final class Multitouch {
     typealias StartFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
     private static var retainedList: CFMutableArray?
 
-    static func start() -> Bool {
+    /// 接続できたデバイス数を返す(0 = 失敗)
+    static func start() -> Int {
         guard let handle = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW),
               let createSym = dlsym(handle, "MTDeviceCreateList"),
               let regSym = dlsym(handle, "MTRegisterContactFrameCallback"),
               let startSym = dlsym(handle, "MTDeviceStart"),
-              let listPtr = unsafeBitCast(createSym, to: CreateListFn.self)() else { return false }
+              let listPtr = unsafeBitCast(createSym, to: CreateListFn.self)() else { return 0 }
         let register = unsafeBitCast(regSym, to: RegisterFn.self)
         let start = unsafeBitCast(startSym, to: StartFn.self)
         let list = Unmanaged<CFMutableArray>.fromOpaque(listPtr).takeRetainedValue()
         retainedList = list
         let n = CFArrayGetCount(list)
-        guard n > 0 else { return false }
+        guard n > 0 else { return 0 }
         for i in 0..<n {
             let dev = CFArrayGetValueAtIndex(list, i)
             register(UnsafeMutableRawPointer(mutating: dev), mtCallback)
             start(UnsafeMutableRawPointer(mutating: dev), 0)
         }
-        return true
+        return n
     }
 }
 
@@ -172,6 +195,8 @@ final class App: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     var enabledItem: NSMenuItem!
     var lastItem: NSMenuItem!
+    var mtItem: NSMenuItem!
+    var statsItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -181,9 +206,13 @@ final class App: NSObject, NSApplicationDelegate {
         enabledItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
         lastItem.isEnabled = false
+        mtItem = NSMenuItem(title: "トラックパッド： —", action: nil, keyEquivalent: "")
+        mtItem.isEnabled = false
+        statsItem = NSMenuItem(title: "受信： 0フレーム / 最大0本", action: nil, keyEquivalent: "")
+        statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(lastItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -191,6 +220,9 @@ final class App: NSObject, NSApplicationDelegate {
 
         Engine.shared.onAction = { [weak self] label in
             self?.lastItem.title = "最後の検出： \(label)"
+        }
+        Engine.shared.onStats = { [weak self] frames, maxFingers in
+            self?.statsItem.title = "受信： \(frames)フレーム / 最大\(maxFingers)本"
         }
 
         // キーを送るにはアクセシビリティ許可が要る
@@ -201,7 +233,9 @@ final class App: NSObject, NSApplicationDelegate {
                   "スワイプで Finder にキーを送るため、システム設定 → プライバシーとセキュリティ → アクセシビリティ で FinderSwipe を許可してください。許可したら FinderSwipe を再起動してください。")
         }
 
-        if !Multitouch.start() {
+        let devices = Multitouch.start()
+        mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： 接続失敗"
+        if devices == 0 {
             alert("トラックパッドを読み込めませんでした",
                   "MultitouchSupport を開くか、トラックパッドの検出に失敗しました。この Mac では試作方式が使えない可能性があります。")
         }
