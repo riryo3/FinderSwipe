@@ -31,6 +31,7 @@ internal static class Program
     private static readonly Dictionary<string, string> configKv = new Dictionary<string, string>();
     private static readonly Dictionary<string, string> neighbor = new Dictionary<string, string>(); // "left" など → 相手のID
     private static readonly Dictionary<long, DateTime> seenActions = new Dictionary<long, DateTime>();
+    private static readonly Dictionary<string, DateTime> seenCursor = new Dictionary<string, DateTime>();
     private static readonly Dictionary<string, string> peers = new Dictionary<string, string>();
     private static readonly Dictionary<string, IPAddress> peerIps = new Dictionary<string, IPAddress>();
     private static long fastSeq = 0;
@@ -604,6 +605,23 @@ internal static class Program
                 long seq;
                 if (parts.Length == 3 && long.TryParse(parts[1], out seq)) ReceiveSwipe(kind, seq);
                 continue;
+            }
+            // 出来事系は送り手が同じ連番で3回送ってくる(落下対策)。Mac 側は重複を捨てているが
+            // Windows 側は捨てていなかったため、キーやクリックが3回ずつ実行されてチャタリングしていた
+            long cseq;
+            if (long.TryParse(parts[1], out cseq))
+            {
+                string dupKey = from + "|" + cseq;
+                DateTime seenAt;
+                if (seenCursor.TryGetValue(dupKey, out seenAt) && (DateTime.UtcNow - seenAt).TotalSeconds < 2) continue;
+                seenCursor[dupKey] = DateTime.UtcNow;
+                if (seenCursor.Count > 512)
+                {
+                    List<string> old = new List<string>();
+                    foreach (KeyValuePair<string, DateTime> p in seenCursor)
+                        if ((DateTime.UtcNow - p.Value).TotalSeconds >= 10) old.Add(p.Key);
+                    foreach (string k in old) seenCursor.Remove(k);
+                }
             }
             ReceiveCursor(kind, rest, from);
         }
