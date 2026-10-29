@@ -1,5 +1,6 @@
 import Cocoa
 import ApplicationServices
+import IOKit
 
 // FinderSwipe: Finder でスワイプ操作するための常駐アプリ(試作)
 // - 2本指の横フリック → 戻る(⌘[) / 進む(⌘])
@@ -446,6 +447,7 @@ final class CursorShare {
         UserDefaults.standard.set(on, forKey: "cursorShare")
         if on {
             installTap()
+            requestInputAccessIfNeeded()
         } else {
             LinkNet.sendReset()
             resetSession()
@@ -459,6 +461,15 @@ final class CursorShare {
         holding = false
         cameFrom = nil
         forwardTo = nil
+    }
+
+    /// 入力監視への「登録」だけ自動で行う。
+    /// アプリ側から許可を求めると、システムの確認が出て、設定のリストに自動で載る(スイッチは切れたまま)。
+    /// スイッチをオンにすること自体は macOS の仕様でユーザー操作でしかできない。
+    func requestInputAccessIfNeeded() {
+        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        }
     }
 
     // MARK: イベントタップ(起点と、参加中の物理入力の扱い)
@@ -850,7 +861,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.flashIcon()
             self?.lastItem.title = "最後の検出： \(label)"
         }
-        if CursorShare.shared.enabled { CursorShare.shared.installTap() }
+        if CursorShare.shared.enabled {
+            CursorShare.shared.installTap()
+            CursorShare.shared.requestInputAccessIfNeeded()
+        }
 
         // キーを送るにはアクセシビリティ許可が要る
         if !AXIsProcessTrusted() {

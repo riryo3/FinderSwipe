@@ -15,9 +15,9 @@ ICONSET="$(mktemp -d)/AppIcon.iconset"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 # 本体（Apple Silicon / Intel 両対応のユニバーサルバイナリ）
-swiftc -O -framework Cocoa -framework ApplicationServices \
+swiftc -O -framework Cocoa -framework ApplicationServices -framework IOKit \
     -target arm64-apple-macos13.0 main.swift -o /tmp/FinderSwipe-arm64
-swiftc -O -framework Cocoa -framework ApplicationServices \
+swiftc -O -framework Cocoa -framework ApplicationServices -framework IOKit \
     -target x86_64-apple-macos13.0 main.swift -o /tmp/FinderSwipe-x86_64
 lipo -create /tmp/FinderSwipe-arm64 /tmp/FinderSwipe-x86_64 -output "$APP/Contents/MacOS/FinderSwipe"
 cp Info.plist "$APP/Contents/Info.plist"
