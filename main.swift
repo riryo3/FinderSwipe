@@ -658,6 +658,28 @@ final class CursorShare {
         cameFrom = nil
         forwardTo = nil
         showCursor()
+        stopPinning()
+    }
+
+    private var frozenPoint: CGPoint?
+    private var pinTimer: Timer?
+
+    /// 渡している間、起点側のカーソルを渡した地点に固定し続ける。
+    /// 非表示が効かない環境(UC の描画など)でも、少なくとも手の動きについて回らなくなる
+    private func startPinning(at point: CGPoint) {
+        frozenPoint = point
+        pinTimer?.invalidate()
+        pinTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self = self, self.awayTo != nil, let p = self.frozenPoint else { return }
+            CGWarpMouseCursorPosition(p)
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
+    }
+
+    private func stopPinning() {
+        pinTimer?.invalidate()
+        pinTimer = nil
+        frozenPoint = nil
     }
 
     private var cursorHidden = false
@@ -825,6 +847,7 @@ final class CursorShare {
             awayTo = next
             for _ in 0..<3 { LinkNet.sendFast("enter \(next) \(ratio)") }
             hideCursor()
+            startPinning(at: loc)
             status("カーソル共有： \(peerName(next)) に渡しました")
             return true
         }
@@ -881,6 +904,7 @@ final class CursorShare {
                 // 起点にカーソルが戻ってきた(セッション自体は継続)
                 awayTo = nil
                 showCursor()
+                stopPinning()
                 if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio); warp() }
                 status("カーソル共有： 手元に戻りました")
             } else if forwardTo == from {
