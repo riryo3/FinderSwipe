@@ -46,6 +46,26 @@ enum SwipeAction: String {
     case forward = "進む"
     case parent = "上の階層へ"
     case open = "開く"
+
+    /// 相方連携で送る合図の名前
+    var wire: String {
+        switch self {
+        case .back: return "back"
+        case .forward: return "forward"
+        case .parent: return "parent"
+        case .open: return "open"
+        }
+    }
+
+    static func fromWire(_ wire: String) -> SwipeAction? {
+        switch wire {
+        case "back": return .back
+        case "forward": return .forward
+        case "parent": return .parent
+        case "open": return .open
+        default: return nil
+        }
+    }
 }
 
 // MARK: - 判定エンジン
@@ -54,7 +74,7 @@ final class Engine {
     static let shared = Engine()
     var enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
     var remoteMode = UserDefaults.standard.bool(forKey: "remoteMode")
-    var ucMode = UserDefaults.standard.bool(forKey: "ucMode")
+    var linkMode = UserDefaults.standard.bool(forKey: "linkMode")
     var keyTapSession = UserDefaults.standard.bool(forKey: "keyTapSession")
     var onAction: ((String) -> Void)?
     var onStats: ((Int, Int) -> Void)?
@@ -125,23 +145,41 @@ final class Engine {
         let front = NSWorkspace.shared.frontmostApplication
         let isFinder = front?.bundleIdentifier == "com.apple.finder"
         let isRemote = remoteMode && front?.localizedName == "Moonlight"
-        // ユニバーサルコントロール用モードでは最前面を問わない
-        // (カーソルが相手側の画面にあるとき、キーはそちらに届く。手元側の Finder でも同じ意味になる)
         var note = ""
         if !enabled {
             note = "（無効中）"
-        } else if isFinder || isRemote || ucMode {
-            switch action {
-            case .back: sendKey(33)      // [
-            case .forward: sendKey(30)   // ]
-            case .parent: sendKey(126)   // ↑
-            case .open: sendKey(31)      // O
-            }
+        } else if isFinder || isRemote {
+            postKey(for: action)
+        } else if linkMode {
+            // ユニバーサルコントロールは合成キーを相手側へ転送しないので、
+            // 手元で処理されなかったスワイプは「合図」として相方に送る
+            LinkNet.send(action.wire)
+            note = "（合図を送信）"
         } else {
             note = "（対象のアプリ以外のため送信なし）"
         }
         let label = action.rawValue + note
         DispatchQueue.main.async { [weak self] in self?.onAction?(label) }
+    }
+
+    /// 相方から合図が届いたとき。自分の Finder が最前面のときだけ実行する
+    func receiveLink(_ wire: String) {
+        guard enabled, linkMode else { return }
+        guard let action = SwipeAction.fromWire(wire) else { return }
+        let front = NSWorkspace.shared.frontmostApplication
+        guard front?.bundleIdentifier == "com.apple.finder" else { return }
+        postKey(for: action)
+        let label = "合図を受信： \(action.rawValue)"
+        DispatchQueue.main.async { [weak self] in self?.onAction?(label) }
+    }
+
+    private func postKey(for action: SwipeAction) {
+        switch action {
+        case .back: sendKey(33)      // [
+        case .forward: sendKey(30)   // ]
+        case .parent: sendKey(126)   // ↑
+        case .open: sendKey(31)      // O
+        }
     }
 
     private func sendKey(_ keyCode: CGKeyCode) {
@@ -152,6 +190,79 @@ final class Engine {
             if let e = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) {
                 e.flags = .maskCommand
                 e.post(tap: tap)
+            }
+        }
+    }
+}
+
+// MARK: - 相方連携(同じネットワーク内で合図を送り合う)
+
+// ユニバーサルコントロールは「本物のキーボード入力」しか相手側へ転送せず、
+// アプリが合成したキーはどちらの送信方式でも届かなかった(実機で確認済み)。
+// そこで、スワイプの「合図」だけを UDP ブロードキャストで送り、
+// 受け側の FinderSwipe が自分の Finder にキーを送る形にする。
+// 注意: 同じ LAN 内なら誰でも合図を送れてしまう試作仕様(家庭内利用前提)。
+enum LinkNet {
+    static let port: UInt16 = 45987
+    private static let magic = "FSWIPE1 "
+    private static var seenSeqs: [UInt64: Double] = [:]
+
+    static func send(_ wire: String) {
+        let seq = UInt64(Date().timeIntervalSince1970 * 1000)
+        let payload = Array((magic + "\(seq) " + wire).utf8)
+        DispatchQueue.global().async {
+            for _ in 0..<3 {  // UDP の取りこぼし対策に、同じ合図を3回送る
+                let fd = socket(AF_INET, SOCK_DGRAM, 0)
+                guard fd >= 0 else { return }
+                var yes: Int32 = 1
+                setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+                var addr = sockaddr_in()
+                addr.sin_family = sa_family_t(AF_INET)
+                addr.sin_port = port.bigEndian
+                addr.sin_addr.s_addr = INADDR_BROADCAST
+                payload.withUnsafeBytes { buf in
+                    withUnsafePointer(to: &addr) { p in
+                        p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            _ = sendto(fd, buf.baseAddress, buf.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+                close(fd)
+                Thread.sleep(forTimeInterval: 0.03)
+            }
+        }
+    }
+
+    static func startReceiver() {
+        DispatchQueue.global().async {
+            let fd = socket(AF_INET, SOCK_DGRAM, 0)
+            guard fd >= 0 else { return }
+            var yes: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            addr.sin_addr.s_addr = INADDR_ANY
+            let bound = withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bound == 0 else { return }
+            var buf = [UInt8](repeating: 0, count: 256)
+            while true {
+                let n = recv(fd, &buf, buf.count, 0)
+                guard n > 0 else { continue }
+                let s = String(decoding: buf[0..<n], as: UTF8.self)
+                guard s.hasPrefix(magic) else { continue }
+                let parts = s.dropFirst(magic.count).split(separator: " ")
+                guard parts.count == 2, let seq = UInt64(parts[0]) else { continue }
+                // 3回送られてくる同じ合図は1回だけ実行する
+                let now = Date().timeIntervalSince1970
+                if let seen = seenSeqs[seq], now - seen < 2 { continue }
+                seenSeqs[seq] = now
+                seenSeqs = seenSeqs.filter { now - $0.value < 10 }
+                Engine.shared.receiveLink(String(parts[1]))
             }
         }
     }
@@ -207,7 +318,7 @@ final class App: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     var enabledItem: NSMenuItem!
     var remoteItem: NSMenuItem!
-    var ucItem: NSMenuItem!
+    var linkItem: NSMenuItem!
     var tapItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
@@ -221,8 +332,8 @@ final class App: NSObject, NSApplicationDelegate {
         enabledItem.target = self
         remoteItem = NSMenuItem(title: "リモート操作モード（Moonlight 使用時も有効）", action: #selector(toggleRemote), keyEquivalent: "")
         remoteItem.target = self
-        ucItem = NSMenuItem(title: "ユニバーサルコントロール用（最前面を問わず送る）", action: #selector(toggleUC), keyEquivalent: "")
-        ucItem.target = self
+        linkItem = NSMenuItem(title: "相方モード（ネットワークで合図を送受信）", action: #selector(toggleLink), keyEquivalent: "")
+        linkItem.target = self
         tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
         tapItem.target = self
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
@@ -233,7 +344,7 @@ final class App: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(ucItem); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -255,6 +366,8 @@ final class App: NSObject, NSApplicationDelegate {
                   "スワイプで Finder にキーを送るため、システム設定 → プライバシーとセキュリティ → アクセシビリティ で FinderSwipe を許可してください。許可したら FinderSwipe を再起動してください。")
         }
 
+        LinkNet.startReceiver()
+
         let devices = Multitouch.start()
         mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： 接続失敗"
         if devices == 0 {
@@ -266,7 +379,7 @@ final class App: NSObject, NSApplicationDelegate {
     func refreshMenu() {
         enabledItem.state = Engine.shared.enabled ? .on : .off
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
-        ucItem.state = Engine.shared.ucMode ? .on : .off
+        linkItem.state = Engine.shared.linkMode ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
     }
 
@@ -294,9 +407,9 @@ final class App: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
-    @objc func toggleUC() {
-        Engine.shared.ucMode.toggle()
-        UserDefaults.standard.set(Engine.shared.ucMode, forKey: "ucMode")
+    @objc func toggleLink() {
+        Engine.shared.linkMode.toggle()
+        UserDefaults.standard.set(Engine.shared.linkMode, forKey: "linkMode")
         refreshMenu()
     }
 
