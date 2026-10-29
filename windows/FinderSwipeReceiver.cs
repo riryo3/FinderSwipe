@@ -29,6 +29,7 @@ internal static class Program
     private static readonly Dictionary<string, string> neighbor = new Dictionary<string, string>(); // "left" など → 相手のID
     private static readonly Dictionary<long, DateTime> seenActions = new Dictionary<long, DateTime>();
     private static readonly Dictionary<string, string> peers = new Dictionary<string, string>();
+    private static readonly Dictionary<string, IPAddress> peerIps = new Dictionary<string, IPAddress>();
     private static long fastSeq = 0;
     private static UdpClient sender;
 
@@ -109,14 +110,38 @@ internal static class Program
     private static void PressKey(ushort vk) { SendInputs(MakeKey(vk, false), MakeKey(vk, true)); }
 
     // ---- 合図の送信 ----
-    private static void SendRaw(string body)
+    private static void SendBytes(byte[] data, string body)
     {
-        byte[] data = Encoding.UTF8.GetBytes(Magic + myId + " " + Interlocked.Increment(ref fastSeq) + " " + body);
-        try { sender.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, Port)); }
+        // 宛先の IP が分かればユニキャスト、無ければブロードキャスト。
+        // ブロードキャストは Wi-Fi で遅延・落下が多く、カクつきと合図落ちの原因になる
+        IPAddress ip = IPAddress.Broadcast;
+        string[] bp = body.Split(' ');
+        IPAddress known;
+        if (bp.Length >= 2 && peerIps.TryGetValue(bp[1], out known)) ip = known;
+        try { sender.Send(data, data.Length, new IPEndPoint(ip, Port)); }
         catch (Exception) { /* 送れなくても落とさない */ }
     }
 
-    private static void SendFast(string body) { SendRaw(body); }
+    private static void SendRaw(string body)
+    {
+        byte[] data = Encoding.UTF8.GetBytes(Magic + myId + " " + Interlocked.Increment(ref fastSeq) + " " + body);
+        SendBytes(data, body);
+    }
+
+    private static void SendFast(string body)
+    {
+        byte[] data = Encoding.UTF8.GetBytes(Magic + myId + " " + Interlocked.Increment(ref fastSeq) + " " + body);
+        if (body.StartsWith("mv ")) { SendBytes(data, body); return; }
+        // 出来事系(enter/leave/キー/クリック等)は落とすと致命的なので、同じデータを3回送る(受け側で重複を捨てる)
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                SendBytes(data, body);
+                if (i < 2) Thread.Sleep(10);
+            }
+        });
+    }
 
     private static void SendHello()
     {
@@ -398,6 +423,7 @@ internal static class Program
             if (parts.Length < 3) continue;
             string from = parts[0];
             if (from == myId) continue;
+            peerIps[from] = fromEp.Address;
             string kind = parts[2];
             string[] rest = new string[parts.Length - 3];
             Array.Copy(parts, 3, rest, 0, rest.Length);

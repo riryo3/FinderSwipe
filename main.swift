@@ -290,7 +290,7 @@ enum LinkNet {
         return s
     }()
 
-    private static func udpSend(_ text: String) {
+    private static func udpSend(_ text: String, toIP ip: String? = nil) {
         // 送信用ソケットは1つを使い回す(合図のたびに作り直すとマウス移動が重くなる)
         if sendFd < 0 {
             sendFd = socket(AF_INET, SOCK_DGRAM, 0)
@@ -302,7 +302,11 @@ enum LinkNet {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = INADDR_BROADCAST
+        if let ip = ip {
+            addr.sin_addr.s_addr = inet_addr(ip)
+        } else {
+            addr.sin_addr.s_addr = INADDR_BROADCAST
+        }
         payload.withUnsafeBytes { buf in
             withUnsafePointer(to: &addr) { p in
                 p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -367,10 +371,17 @@ enum LinkNet {
         fastSeq &+= 1
         let text = magic + "\(machineID) \(fastSeq) \(body)"
         if emitViaTCP(text, body: body) { return }
-        udpSend(text)
+        // TCP が無い相手(Windows など)には、IP が分かればユニキャストで送る。
+        // Wi-Fi のブロードキャストは遅延と落下が多く、カクつきと合図落ちの原因になるため
+        var ip: String? = nil
+        let bparts = body.split(separator: " ")
+        if bparts.count >= 2, let info = peers[String(bparts[1])], Date().timeIntervalSince(info.seen) < 20 {
+            ip = info.ip
+        }
+        udpSend(text, toIP: ip)
         if copies > 1 {
             for delay in [0.010, 0.020] {
-                sendQueue.asyncAfter(deadline: .now() + delay) { udpSend(text) }
+                sendQueue.asyncAfter(deadline: .now() + delay) { udpSend(text, toIP: ip) }
             }
         }
     }
