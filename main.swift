@@ -148,13 +148,17 @@ final class Engine {
         var note = ""
         if !enabled {
             note = "（無効中）"
-        } else if isFinder || isRemote {
+        } else if isFinder {
             postKey(for: action)
         } else if linkMode {
             // ユニバーサルコントロールは合成キーを相手側へ転送しないので、
-            // 手元で処理されなかったスワイプは「合図」として相方に送る
+            // 手元で処理されなかったスワイプは「合図」として相方に送る。
+            // Moonlight のときも、相方モードがオンならキー直送より合図を優先する
+            // (Windows など、受け側でキー変換が必要な相手にも同じ合図で届くため)
             LinkNet.send(action.wire)
             note = "（合図を送信）"
+        } else if isRemote {
+            postKey(for: action)
         } else {
             note = "（対象のアプリ以外のため送信なし）"
         }
