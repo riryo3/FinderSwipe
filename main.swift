@@ -968,6 +968,9 @@ final class CursorShare {
     /// 自分が起点で、カーソルが相手側にある状態か
     var sessionActiveAway: Bool { sending && awayTo != nil }
 
+    /// 共有セッションのどの役割でもあるか(起点・保持・中継)
+    var anySessionActive: Bool { sending || holding || forwardTo != nil }
+
     /// スワイプのアクションを、相手へのキー入力(⌘付き)として送る
     func forwardActionKey(for action: SwipeAction) {
         guard let to = awayTo else { return }
@@ -2061,6 +2064,115 @@ final class ClipShare {
     }
 }
 
+
+// MARK: - ダイアログへのスナップ
+
+/// Windows の「既定のボタンにポインターを移動する」にあたる機能。
+/// ダイアログ(シート含む)が現れたら、その既定ボタンの真ん中へカーソルを運ぶ。
+/// 最前面アプリのウィンドウ生成を Accessibility で監視する
+final class DialogSnap {
+    static let shared = DialogSnap()
+    var enabled = UserDefaults.standard.bool(forKey: "snapToDialog")
+    private var observer: AXObserver?
+    private var observedPID: pid_t = 0
+    private var seenWindows = Set<Int>()
+    private var workspaceObserver: NSObjectProtocol?
+
+    func start() {
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.attachToFrontmost()
+        }
+        attachToFrontmost()
+    }
+
+    private func attachToFrontmost() {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return }
+        let pid = app.processIdentifier
+        if pid == ProcessInfo.processInfo.processIdentifier { return }
+        let appEl = AXUIElementCreateApplication(pid)
+        if pid == observedPID, observer != nil {
+            scan(appElement: appEl)
+            return
+        }
+        detach()
+        observedPID = pid
+        var obs: AXObserver?
+        guard AXObserverCreate(pid, { _, element, _, _ in
+            var r: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &r) == .success,
+               (r as? String) == (kAXApplicationRole as String) {
+                DialogSnap.shared.scan(appElement: element)
+            } else {
+                DialogSnap.shared.inspect(window: element)
+            }
+        }, &obs) == .success, let observer = obs else { return }
+        _ = AXObserverAddNotification(observer, appEl, kAXWindowCreatedNotification as CFString, nil)
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        self.observer = observer
+        scan(appElement: appEl)
+    }
+
+    private func detach() {
+        if let observer = observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+            self.observer = nil
+        }
+        observedPID = 0
+    }
+
+    /// 既存のウィンドウを走査する(アプリ切替時など、既に出ているダイアログ用)
+    func scan(appElement: AXUIElement) {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &ref) == .success,
+              let windows = ref as? [AXUIElement] else { return }
+        for w in windows { inspect(window: w) }
+    }
+
+    func inspect(window: AXUIElement) {
+        guard enabled, !CursorShare.shared.anySessionActive else { return }
+        var wid: CGWindowID = 0
+        _ = _AXUIElementGetWindow(window, &wid)
+        if wid != 0 {
+            if seenWindows.contains(Int(wid)) { return }
+            seenWindows.insert(Int(wid))
+            if seenWindows.count > 200 { seenWindows.removeAll() }
+        }
+        guard isDialogLike(window) else { return }
+        var btnRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, "AXDefaultButton" as CFString, &btnRef) == .success,
+              let btn = btnRef else { return }
+        let button = btn as! AXUIElement
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(button, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(button, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posV = posRef, let sizeV = sizeRef else { return }
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(posV as! AXValue, .cgPoint, &pos)
+        AXValueGetValue(sizeV as! AXValue, .cgSize, &size)
+        guard size.width > 0, size.height > 0 else { return }
+        CGWarpMouseCursorPosition(CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2))
+    }
+
+    /// ダイアログ本体か、シート(親がウィンドウ)なら true
+    private func isDialogLike(_ window: AXUIElement) -> Bool {
+        var subRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subRef) == .success,
+           let sub = subRef as? String,
+           sub == (kAXDialogSubrole as String) || sub == (kAXSystemDialogSubrole as String) { return true }
+        var parentRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(window, kAXParentAttribute as CFString, &parentRef) == .success,
+           let parent = parentRef {
+            var roleRef: CFTypeRef?
+            let parentEl = parent as! AXUIElement
+            if AXUIElementCopyAttributeValue(parentEl, kAXRoleAttribute as CFString, &roleRef) == .success,
+               (roleRef as? String) == (kAXWindowRole as String) { return true }
+        }
+        return false
+    }
+}
+
 // MARK: - アプリ本体
 
 /// メニューバー用の「指3本」アイコン(テンプレート画像)
@@ -2092,6 +2204,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pushItems: [NSMenuItem] = []
     var multItems: [NSMenuItem] = []
     var clipItem: NSMenuItem!
+    var snapItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -2107,6 +2220,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cursorItem.target = self
         clipItem = NSMenuItem(title: "クリップボード共有", action: #selector(toggleClip), keyEquivalent: "")
         clipItem.target = self
+        snapItem = NSMenuItem(title: "ダイアログの既定ボタンへカーソルを移動", action: #selector(toggleSnap), keyEquivalent: "")
+        snapItem.target = self
         let layoutItem = NSMenuItem(title: "レイアウトを編集…", action: #selector(openLayoutEditor), keyEquivalent: "")
         layoutItem.target = self
         tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
@@ -2150,7 +2265,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
@@ -2189,6 +2304,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.lastItem.title = "最後の検出： \(label)"
         }
         ClipShare.shared.start()
+        DialogSnap.shared.start()
 
         let devices = Multitouch.start()
         mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： 接続失敗"
@@ -2204,6 +2320,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         linkItem.state = Engine.shared.linkMode ? .on : .off
         cursorItem.state = CursorShare.shared.enabled ? .on : .off
         clipItem.state = ClipShare.shared.enabled ? .on : .off
+        snapItem.state = DialogSnap.shared.enabled ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
         diagItem.state = UserDefaults.standard.bool(forKey: "showDiag") ? .on : .off
         for it in pushItems { it.state = it.tag == CursorShare.pushPx ? .on : .off }
@@ -2262,6 +2379,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleClip() {
         ClipShare.shared.enabled.toggle()
         UserDefaults.standard.set(ClipShare.shared.enabled, forKey: "clipShare")
+        refreshMenu()
+    }
+
+    @objc func toggleSnap() {
+        DialogSnap.shared.enabled.toggle()
+        UserDefaults.standard.set(DialogSnap.shared.enabled, forKey: "snapToDialog")
         refreshMenu()
     }
 
