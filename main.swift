@@ -885,7 +885,7 @@ final class CursorShare {
             guard let next = neighbors[dir] else { continue }
             sending = true
             awayTo = next
-            for _ in 0..<3 { LinkNet.sendFast("enter \(next) \(ratio)") }
+            for _ in 0..<3 { LinkNet.sendFast("enter \(next) \(ratio) \(dir.rawValue)") }
             hideCursor()
             startPinning(at: loc)
             status("カーソル共有： \(peerName(next)) に渡しました")
@@ -986,7 +986,7 @@ final class CursorShare {
             cameFrom = nil
             status("カーソル共有： 手元に返しました")
         } else {
-            LinkNet.sendFast("enter \(next) \(ratio)")
+            LinkNet.sendFast("enter \(next) \(ratio) \(dir.rawValue)")
             forwardTo = next
             holding = false
             status("カーソル共有： \(peerName(next)) へ渡しました")

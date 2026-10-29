@@ -26,6 +26,7 @@ internal static class Program
     // ---- 設定と自分の情報 ----
     private static string myId;
     private static string myName;
+    private static readonly Dictionary<string, string> configKv = new Dictionary<string, string>();
     private static readonly Dictionary<string, string> neighbor = new Dictionary<string, string>(); // "left" など → 相手のID
     private static readonly Dictionary<long, DateTime> seenActions = new Dictionary<long, DateTime>();
     private static readonly Dictionary<string, string> peers = new Dictionary<string, string>();
@@ -161,7 +162,7 @@ internal static class Program
         {
             try { File.Copy(oldPath, path); } catch (Exception) { }
         }
-        Dictionary<string, string> kv = new Dictionary<string, string>();
+        Dictionary<string, string> kv = configKv;
         if (File.Exists(path))
         {
             foreach (string line in File.ReadAllLines(path))
@@ -193,6 +194,43 @@ internal static class Program
             string v;
             if (kv.TryGetValue(d, out v) && v.Length > 0) neighbor[d] = v;
         }
+    }
+
+    private static string OppositeDir(string d)
+    {
+        if (d == "right") return "left";
+        if (d == "left") return "right";
+        if (d == "up") return "down";
+        if (d == "down") return "up";
+        return null;
+    }
+
+    // 学習した隣を ini にも書き戻す(次回起動でも覚えているように)
+    private static void SaveConfig()
+    {
+        try
+        {
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "OneManCursor.ini");
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("; ワンマンカーソル Windows 設定 (隣は自動でも覚えます)");
+            string v;
+            sb.AppendLine("name=" + (configKv.TryGetValue("name", out v) ? v : ""));
+            sb.AppendLine("id=" + myId);
+            foreach (string d in new string[] { "left", "right", "up", "down" })
+                sb.AppendLine(d + "=" + (configKv.TryGetValue(d, out v) ? v : ""));
+            File.WriteAllText(path, sb.ToString());
+        }
+        catch (Exception) { }
+    }
+
+    private static void LearnNeighbor(string dir, string id)
+    {
+        string cur;
+        if (neighbor.TryGetValue(dir, out cur) && cur == id) return;
+        neighbor[dir] = id;
+        configKv[dir] = id;
+        SaveConfig();
+        Console.WriteLine("カーソル共有: 隣 (" + dir + ") に " + PeerName(id) + " を覚えました");
     }
 
     private static string DirOf(string id)
@@ -232,7 +270,7 @@ internal static class Program
         }
         else
         {
-            SendFast("enter " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            SendFast("enter " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + dir);
             forwardTo = next;
             holding = false;
             Console.WriteLine("カーソル共有: " + PeerName(next) + " へ渡しました");
@@ -310,7 +348,14 @@ internal static class Program
             if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
             holding = true;
             cameFrom = from;
-            string d = DirOf(from);
+            string d = null;
+            if (args.Length > 1)
+            {
+                // 送り手が「出た方向」を付けていれば、その反対側の隣として自動で覚える(ini 編集は不要になる)
+                string od = OppositeDir(args[1]);
+                if (od != null) { LearnNeighbor(od, from); d = od; }
+            }
+            if (d == null) d = DirOf(from);
             if (d != null) PositionAtEdge(d, ratio);
             Console.WriteLine("カーソル共有: " + PeerName(from) + " から受け取りました");
         }
