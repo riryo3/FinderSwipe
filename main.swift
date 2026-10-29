@@ -211,6 +211,12 @@ enum LinkNet {
     private static let magic = "FSWIPE1 "
     private static var seenSeqs: [UInt64: Double] = [:]
     private static var fastSeq: UInt64 = 0
+    private static var sendFd: Int32 = -1
+    private static let sendQueue = DispatchQueue(label: "finderswipe.send")
+    private static var pendingTarget: String?
+    private static var pendingDx = 0
+    private static var pendingDy = 0
+    private static var flushScheduled = false
 
     /// 発見した相方(id → 名前と最終確認時刻)
     private(set) static var peers: [String: (name: String, seen: Date)] = [:]
@@ -240,11 +246,14 @@ enum LinkNet {
     }()
 
     private static func udpSend(_ text: String) {
+        // 送信用ソケットは1つを使い回す(合図のたびに作り直すとマウス移動が重くなる)
+        if sendFd < 0 {
+            sendFd = socket(AF_INET, SOCK_DGRAM, 0)
+            guard sendFd >= 0 else { return }
+            var yes: Int32 = 1
+            setsockopt(sendFd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+        }
         let payload = Array(text.utf8)
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
-        guard fd >= 0 else { return }
-        var yes: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
@@ -252,11 +261,10 @@ enum LinkNet {
         payload.withUnsafeBytes { buf in
             withUnsafePointer(to: &addr) { p in
                 p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    _ = sendto(fd, buf.baseAddress, buf.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    _ = sendto(sendFd, buf.baseAddress, buf.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
         }
-        close(fd)
     }
 
     /// スワイプの合図(確実に届けたいので同じものを3回送る)
@@ -271,8 +279,43 @@ enum LinkNet {
         }
     }
 
-    /// カーソル共有の細かい合図(速さ優先で1回だけ送る)
+    /// カーソル共有の細かい合図。送信は専用キューに逃がし、動き(mv)は約6ms分をまとめて送る
+    /// (タップの中で同期送信したり、1イベントごとに送ったりすると全体が重くなるため)
     static func sendFast(_ body: String) {
+        sendQueue.async {
+            if body.hasPrefix("mv ") {
+                let p = body.split(separator: " ")
+                if p.count == 4, let dx = Int(p[2]), let dy = Int(p[3]) {
+                    if pendingTarget != String(p[1]) { flushMove() }
+                    pendingTarget = String(p[1])
+                    pendingDx += dx
+                    pendingDy += dy
+                    if !flushScheduled {
+                        flushScheduled = true
+                        sendQueue.asyncAfter(deadline: .now() + 0.006) {
+                            flushMove()
+                            flushScheduled = false
+                        }
+                    }
+                    return
+                }
+            }
+            flushMove()
+            rawSend(body)
+        }
+    }
+
+    private static func flushMove() {
+        guard let t = pendingTarget else { return }
+        pendingTarget = nil
+        if pendingDx != 0 || pendingDy != 0 {
+            rawSend("mv \(t) \(pendingDx) \(pendingDy)")
+            pendingDx = 0
+            pendingDy = 0
+        }
+    }
+
+    private static func rawSend(_ body: String) {
         fastSeq &+= 1
         udpSend(magic + "\(machineID) \(fastSeq) \(body)")
     }
@@ -632,7 +675,7 @@ final class CursorShare {
             if vy < Double(b.minY), cross(.up, ratio: rx) { return }
             vx = min(max(vx, Double(b.minX)), Double(b.maxX) - 1)
             vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
-            warp()
+            warpThrottled()
         case "dn", "up":
             guard let n = args.first.flatMap({ Int($0) }) else { return }
             postMouse(down: kind == "dn", button: n)
@@ -657,6 +700,29 @@ final class CursorShare {
     private func warp() {
         CGWarpMouseCursorPosition(CGPoint(x: vx, y: vy))
         CGAssociateMouseAndMouseCursorPosition(1)
+    }
+
+    private var lastWarp = Date.distantPast
+    private var warpScheduled = false
+
+    /// 受け側のカーソル移動は最大で約8msに1回に間引く(合図のたびにワープさせると重くなるため)
+    private func warpThrottled() {
+        if Date().timeIntervalSince(lastWarp) >= 0.008 {
+            lastWarp = Date()
+            warp()
+            return
+        }
+        if !warpScheduled {
+            warpScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.008) { [weak self] in
+                guard let self = self else { return }
+                self.warpScheduled = false
+                if self.holding {
+                    self.lastWarp = Date()
+                    self.warp()
+                }
+            }
+        }
     }
 
     private func postMouse(down: Bool, button: Int) {
@@ -761,8 +827,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statsItem.isEnabled = false
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
+        let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
+        inputItem.target = self
         menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(layoutParent); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
-        menu.addItem(permItem); menu.addItem(.separator())
+        menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         refreshMenu()
@@ -898,6 +966,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openPermSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc func openInputSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
             NSWorkspace.shared.open(url)
         }
     }
