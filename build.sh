@@ -5,6 +5,9 @@ set -e
 cd "$(dirname "$0")"
 
 APP="FinderSwipe.app"
+# ソースのビルド番号を表示する(どの版を作っているか一目で分かるように)
+BUILD_TAG=$(grep -o '"Build [0-9-]*"' main.swift | head -1 | tr -d '"')
+echo "ビルド番号: $BUILD_TAG"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -31,4 +34,4 @@ else
     echo "署名: 場当たり（Apple Development 証明書が見つかりませんでした）"
     codesign --force --deep --sign - "$APP"
 fi
-echo "できた: $APP"
+echo "できた: $APP（$BUILD_TAG）"
