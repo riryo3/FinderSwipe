@@ -34,4 +34,4 @@ else
     echo "署名: 場当たり（Apple Development 証明書が見つかりませんでした）"
     codesign --force --deep --sign - "$APP"
 fi
-echo "できた: $APP（$BUILD_TAG）"
+echo "できた: $APP / $BUILD_TAG"
