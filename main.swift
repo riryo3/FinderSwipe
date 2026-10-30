@@ -8,7 +8,7 @@ import IOKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-30"
+let buildTag = "Build 20261030-31"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2791,8 +2791,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var logWC: LogWindowController?
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = fingerIcon()
+        // どのビルドが動いているかメニューバーで見分けられるよう、番号の末尾を横に出す(暫定措置)
+        if let num = buildTag.split(separator: "-").last {
+            item.button?.title = String(num)
+            item.button?.imagePosition = .imageLeft
+        }
         let menu = NSMenu()
         let buildItem = NSMenuItem(title: buildTag, action: nil, keyEquivalent: "")
         buildItem.isEnabled = false
