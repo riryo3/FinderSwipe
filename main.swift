@@ -9,7 +9,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-60"
+let buildTag = "Build 20261031-61"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -79,6 +79,21 @@ final class Engine {
     static let shared = Engine()
     var enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
     var remoteMode = UserDefaults.standard.bool(forKey: "remoteMode")
+
+    /// リモート操作アプリが最前面かどうか。キー入力を向こうのマシンへ転送するアプリなら
+    /// Moonlight でなくても同じ仕組みでスワイプが効くので、代表的なアプリを対象にしている
+    static func isRemoteApp(_ app: NSRunningApplication?) -> Bool {
+        guard let app = app else { return false }
+        let names = ["Moonlight", "VNC Viewer", "Windows App", "Microsoft Remote Desktop",
+                     "Splashtop", "AnyDesk", "TeamViewer", "Jump Desktop"]
+        if let n = app.localizedName, names.contains(n) { return true }
+        let bids = ["com.moonlight-stream.Moonlight", "com.realvnc.VNCViewer",
+                    "com.microsoft.rdc.macos", "com.microsoft.rdc.mac",
+                    "com.splashtop.Splashtop", "com.teamviewer.TeamViewer",
+                    "com.anydesk.AnyDesk", "com.p5sys.jump.mac.viewer"]
+        if let b = app.bundleIdentifier, bids.contains(b) { return true }
+        return false
+    }
     var linkMode = UserDefaults.standard.bool(forKey: "linkMode")
     var keyTapSession = UserDefaults.standard.bool(forKey: "keyTapSession")
     var onAction: ((String) -> Void)?
@@ -160,7 +175,7 @@ final class Engine {
             if timestamp - lockStableSince >= graceTime, abs(dy) >= vertMin, abs(dy) >= 2 * abs(dx) {
                 let front = NSWorkspace.shared.frontmostApplication
                 let finderContext = front?.bundleIdentifier == "com.apple.finder"
-                    || (remoteMode && front?.localizedName == "Moonlight")
+                    || (remoteMode && Self.isRemoteApp(front))
                     || CursorShare.shared.sessionActiveAway
                 if enabled && !finderContext {
                     // Finder 操作として効かない場面の3本指縦スワイプは切り替え連動に回す
@@ -188,7 +203,7 @@ final class Engine {
         // リモート操作モードでは Moonlight が最前面のときも送る(キーは Moonlight 経由で相手側に届く)
         let front = NSWorkspace.shared.frontmostApplication
         let isFinder = front?.bundleIdentifier == "com.apple.finder"
-        let isRemote = remoteMode && front?.localizedName == "Moonlight"
+        let isRemote = remoteMode && Self.isRemoteApp(front)
         var note = ""
         if !enabled {
             note = "（無効中）"
@@ -2438,11 +2453,29 @@ final class DialogSnap {
         attachToFrontmost()
     }
 
+    private var sweepCounter = 0
+
     private func poll() {
         guard enabled else { return }
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
         scan(appElement: AXUIElementCreateApplication(app.processIdentifier))
+        // システム系のダイアログ(SecurityAgent など)は最前面アプリとして現れないことが
+        // 多いので、2秒に1回、起動中の全アプリも見回る
+        sweepCounter += 1
+        if sweepCounter % 4 == 0 { sweepAllApps() }
+    }
+
+    private func sweepAllApps() {
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        for app in NSWorkspace.shared.runningApplications {
+            let pid = app.processIdentifier
+            if pid == selfPID || pid == frontPID { continue }
+            let el = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(el, 0.25)
+            scan(appElement: el)
+        }
     }
 
     private func attachToFrontmost() {
@@ -3088,6 +3121,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var logWC: LogWindowController?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // 「有効」に束ねたため、旧来の個別設定が食い違っていたら「有効」に合わせる
+        let masterEnabled = Engine.shared.enabled
+        if Engine.shared.linkMode != masterEnabled { Engine.shared.linkMode = masterEnabled; UserDefaults.standard.set(masterEnabled, forKey: "linkMode") }
+        if CursorShare.shared.enabled != masterEnabled { CursorShare.shared.enabled = masterEnabled; UserDefaults.standard.set(masterEnabled, forKey: "cursorShare") }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = fingerIcon()
         let menu = NSMenu()
@@ -3097,14 +3134,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cursorAtItem.isEnabled = false
         enabledItem = NSMenuItem(title: "有効", action: #selector(toggleEnabled), keyEquivalent: "")
         enabledItem.target = self
-        remoteItem = NSMenuItem(title: "リモート操作モード（Moonlight 使用時も有効）", action: #selector(toggleRemote), keyEquivalent: "")
+        remoteItem = NSMenuItem(title: "リモート操作モード（リモート越しでも有効）", action: #selector(toggleRemote), keyEquivalent: "")
         remoteItem.target = self
         linkItem = NSMenuItem(title: "相方モード（ネットワークで合図を送受信）", action: #selector(toggleLink), keyEquivalent: "")
         linkItem.target = self
         cursorItem = NSMenuItem(title: "カーソル共有（端で相手に渡す）", action: #selector(toggleCursor), keyEquivalent: "")
         cursorItem.target = self
         snapItem = NSMenuItem(title: "ダイアログの既定ボタンへカーソルを移動", action: #selector(toggleSnap), keyEquivalent: "")
-        switchItem = NSMenuItem(title: "切り替え画面の連動", action: #selector(toggleSwitch), keyEquivalent: "")
+        switchItem = NSMenuItem(title: "Mission Control／タスクビュー連動", action: #selector(toggleSwitch), keyEquivalent: "")
         switchItem.target = self
         searchItem = NSMenuItem(title: "検索の連動", action: #selector(toggleSearch), keyEquivalent: "")
         searchItem.target = self
@@ -3152,12 +3189,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statsItem.isEnabled = false
         diagItem = NSMenuItem(title: "状態の詳細を表示", action: #selector(toggleDiag), keyEquivalent: "")
         diagItem.target = self
-        let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
+        let permItem = NSMenuItem(title: "デバイスの制御とデータへのアクセスの許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
+        let screenItem = NSMenuItem(title: "画面収録とシステムオーディオの録音の許可を開く…", action: #selector(openScreenSettings), keyEquivalent: "")
+        screenItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(soloItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(logItem); menu.addItem(.separator())
-        menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
+        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(soloItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(logItem); menu.addItem(.separator())
+        menu.addItem(permItem); menu.addItem(screenItem); menu.addItem(inputItem); menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         applyDiagVisibility()
@@ -3179,12 +3218,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             CursorShare.shared.requestInputAccessIfNeeded()
         }
 
-        // キーを送るにはアクセシビリティ許可が要る
+        // キーを送るにはデバイスの制御とデータへのアクセスの許可が要る
         if !AXIsProcessTrusted() {
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(opts)
-            alert("アクセシビリティ許可が必要です",
-                  "スワイプで Finder にキーを送るため、システム設定 → プライバシーとセキュリティ → アクセシビリティ で FinderSwipe を許可してください。許可したら FinderSwipe を再起動してください。")
+            alert("デバイスの制御とデータへのアクセスの許可が必要です",
+                  "スワイプで Finder にキーを送るため、システム設定 → プライバシーとセキュリティ → デバイスの制御とデータへのアクセス で FinderSwipe を許可してください。許可したら FinderSwipe を再起動してください。")
         }
 
         NetLog.shared.start()
@@ -3289,8 +3328,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleEnabled() {
-        Engine.shared.enabled.toggle()
-        UserDefaults.standard.set(Engine.shared.enabled, forKey: "enabled")
+        // 「有効」はスワイプ・相方(合図の送受信)・カーソル共有をまとめて切り替える
+        let on = !Engine.shared.enabled
+        Engine.shared.enabled = on
+        UserDefaults.standard.set(on, forKey: "enabled")
+        Engine.shared.linkMode = on
+        UserDefaults.standard.set(on, forKey: "linkMode")
+        if CursorShare.shared.enabled != on { CursorShare.shared.setEnabled(on) }
         refreshMenu()
     }
 
@@ -3394,6 +3438,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openInputSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc func openScreenSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
     }
