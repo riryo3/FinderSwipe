@@ -9,7 +9,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-67"
+let buildTag = "Build 20261031-68"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -131,6 +131,7 @@ final class Engine {
     private var startT: Double = 0
     private var fired = false
     private var lastDx: Float = 0, lastDy: Float = 0   // 診断用: 最後に見た移動量
+    private var horizLatch = false   // ブラウザ向け押し出し: 横意図を一度掴んだら保持する
 
     // しきい値(正規化座標 0...1 に対する割合)
     private let flickMin: Float = 0.20     // 2本指フリックの最小移動量
@@ -145,6 +146,7 @@ final class Engine {
                 NetLog.shared.log("ジェスチャ不成立: 指\(lockedCount)本 dy=\(lastDy) dx=\(lastDx)")
             }
             if session { CursorShare.shared.releaseScrollSuppress() }
+            horizLatch = false
             session = false; fired = false; lockedCount = 0; return
         }
         let n = downs.count
@@ -169,8 +171,9 @@ final class Engine {
             // (Chrome のスワイプはフリックより遅く長いので、通常のフリック判定では拾えない)。
             // 指の動きそのもので判定するので、指を離した後の反動(惰性スクロール)は混ざらない
             if CursorShare.shared.sessionActiveAway, CursorShare.shared.remoteIsBrowser {
-                if abs(dx) >= 0.06, abs(dx) >= 2 * abs(dy) { CursorShare.shared.engageScrollSuppress() }
-                if abs(dx) >= 0.15, abs(dx) >= 2 * abs(dy), elapsed <= 1.5 {
+                if abs(dx) >= 0.05, abs(dx) >= 1.5 * abs(dy) { horizLatch = true }
+                if horizLatch { CursorShare.shared.engageScrollSuppress() }
+                if horizLatch, abs(dx) >= 0.15, abs(dx) >= 1.5 * abs(dy), elapsed <= 1.5 {
                     fire(dx > 0 ? .back : .forward)
                     return
                 }
@@ -874,6 +877,7 @@ final class CursorShare {
         cameFrom = nil
         forwardTo = nil
         remoteAppID = nil
+        remoteAppPeer = nil
         showCursor()
         stopPinning()
         EdgeGlow.shared.hide()
@@ -1129,6 +1133,7 @@ final class CursorShare {
 
     /// 起点が知っている「相手の最前面アプリ」(保持者からの app 報告。未報告なら nil)
     private(set) var remoteAppID: String?
+    private(set) var remoteAppPeer: String?
 
     private var appObserver: NSObjectProtocol?
 
@@ -1157,7 +1162,7 @@ final class CursorShare {
 
     /// 相手の最前面がブラウザか(app 報告ベース)
     var remoteIsBrowser: Bool {
-        guard let bid = remoteAppID else { return false }
+        guard let bid = remoteAppID, remoteAppPeer == awayTo else { return false }
         return Self.browserIDs.contains(bid)
     }
 
@@ -1180,7 +1185,7 @@ final class CursorShare {
 
     /// 共有中のスワイプを相手へ送ってよいか(相手のアプリで判断する)
     func swipeAllowedRemotely(_ action: SwipeAction) -> Bool {
-        guard let bid = remoteAppID else { return true }
+        guard let bid = remoteAppID, remoteAppPeer == awayTo else { return true }
         if bid == "com.apple.finder" { return true }
         if Self.browserIDs.contains(bid) { return action == .back || action == .forward }
         return false
@@ -1273,6 +1278,7 @@ final class CursorShare {
             let seg = lk.end > lk.start ? min(1, max(0, (ratio - lk.start) / (lk.end - lk.start))) : 0.5
             sending = true
             awayTo = lk.id
+            if remoteAppPeer != lk.id { remoteAppID = nil; remoteAppPeer = nil }
             edgePush.removeAll()
             multAccX = 0; multAccY = 0
             for _ in 0..<3 { LinkNet.sendFast("enter \(lk.id) \(seg) \(dir.rawValue)") }
@@ -1420,7 +1426,7 @@ final class CursorShare {
         case "at":
             if let holder = rest.first { cursorAtID = holder }
         case "app":
-            if let bid = rest.first { remoteAppID = bid }
+            if let bid = rest.first { remoteAppID = bid; remoteAppPeer = from }
         case "mother":
             UserDefaults.standard.set(from, forKey: "mothershipID")
             status("母艦は \(peerName(from)) になりました")
