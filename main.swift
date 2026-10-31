@@ -9,7 +9,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-63"
+let buildTag = "Build 20261031-64"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -3228,6 +3228,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         inputItem.target = self
         menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(soloItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(logItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(screenItem); menu.addItem(inputItem); menu.addItem(.separator())
+        let relaunchItem = NSMenuItem(title: "再起動", action: #selector(relaunchSelf), keyEquivalent: "")
+        relaunchItem.target = self
+        menu.addItem(relaunchItem)
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         applyDiagVisibility()
@@ -3453,6 +3456,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastItem.isHidden = !v
         mtItem.isHidden = !v
         statsItem.isHidden = !v
+    }
+
+    /// 不調時の立て直し用: 別インスタンスとして自分を起動し直してから終了する
+    @objc func relaunchSelf() {
+        LinkNet.sendReset()
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: config) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 
     @objc func toggleTap() {
