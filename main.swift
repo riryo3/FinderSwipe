@@ -9,7 +9,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-56"
+let buildTag = "Build 20261031-57"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -988,7 +988,7 @@ final class CursorShare {
         }
         guard enabled else { return Unmanaged.passUnretained(event) }
         // 手元にカーソルがあるときは、端への近さでボーダー表示を更新する
-        if enabled, !sending, !holding, forwardTo == nil,
+        if enabled, awayTo == nil, !holding, forwardTo == nil,
            type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged {
             updateGlowAtHome(event.location)
         }
@@ -1640,7 +1640,7 @@ final class EdgeGlow {
         w.hasShadow = false
         w.ignoresMouseEvents = true
         w.level = .screenSaver
-        w.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         window = w
         view = v
     }
